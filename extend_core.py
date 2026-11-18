@@ -32,12 +32,34 @@ def probe(path):
                 "duration": dur, "audio": bool(c.streams.audio)}
 
 
+try:
+    from av.video.reformatter import Colorspace as _CS, ColorRange as _CR
+except ImportError:  # older PyAV
+    _CS = _CR = None
+
+
+def _to_rgb(f):
+    """Decode to RGB with the frame's own colour tags; untagged HD is read as BT.709 and untagged range as limited
+    (what players do), so a clip written by this pack, or by most tools, comes back with the same levels."""
+    if _CS is None:
+        return f.to_ndarray(format="rgb24")
+    cs = int(getattr(f, "colorspace", 2) or 2)
+    rng = int(getattr(f, "color_range", 0) or 0)
+    src_cs = cs if cs not in (2, 3) else (_CS.ITU709 if f.height >= 720 else _CS.ITU601)
+    src_rng = rng if rng in (1, 2) else _CR.MPEG
+    try:
+        return f.reformat(format="rgb24", src_colorspace=src_cs, src_color_range=src_rng,
+                          dst_color_range=_CR.JPEG).to_ndarray()
+    except (TypeError, ValueError):
+        return f.to_ndarray(format="rgb24")
+
+
 def iter_frames(path, fmt="rgb24"):
     with av.open(path) as c:
         vs = c.streams.video[0]
         vs.thread_type = "AUTO"
         for f in c.decode(vs):
-            yield f.to_ndarray(format=fmt)
+            yield _to_rgb(f) if fmt == "rgb24" else f.to_ndarray(format=fmt)
 
 
 def edge_frames(path):
@@ -88,12 +110,23 @@ def _open_writer(path, fps, width, height, crf=12, preset="fast", audio=False):
     vs = out.add_stream("libx264", rate=fps, options={"crf": str(crf), "preset": preset})
     vs.width, vs.height, vs.pix_fmt = width, height, "yuv420p"
     vs.codec_context.time_base = Fraction(1) / fps
+    for k, v in (("colorspace", 1), ("color_primaries", 1), ("color_trc", 1), ("color_range", 1)):  # BT.709, limited
+        try:
+            setattr(vs.codec_context, k, v)
+        except (AttributeError, TypeError, ValueError):
+            pass
     oa = out.add_stream("aac", rate=AUDIO_RATE, layout="stereo") if audio else None
     return out, vs, oa
 
 
 def _put(out, vs, arr, pts):
     f = av.VideoFrame.from_ndarray(np.ascontiguousarray(arr), format="rgb24")
+    if _CS is not None:
+        try:
+            f = f.reformat(format="yuv420p", src_colorspace=_CS.ITU709, dst_colorspace=_CS.ITU709,
+                           src_color_range=_CR.JPEG, dst_color_range=_CR.MPEG, dst_color_trc=1, dst_color_primaries=1)
+        except (TypeError, ValueError):
+            pass
     f.pts = pts
     f.time_base = vs.codec_context.time_base
     for p in vs.encode(f):
@@ -370,23 +403,24 @@ def seam_window(path, seam, context=9, gap=23, pixels=921600):
     return np.stack(frames), W, H, fps, start, round(jump, 3)
 
 
-def seam_splice(path, out_path, frames, start, context=9, blend=3, crf=12, preset="fast"):
-    """Put regenerated frames back: window frames context .. len-context-1 replace the video's frames from
-    start + context on (scaled to the video's size), blended into the original over `blend` frames at each edge.
-    Every other frame and the sound stay as they are."""
+def seam_splice(path, out_path, windows, context=9, blend=3, crf=12, preset="fast"):
+    """Put regenerated windows back, all in one pass (one encode): for each (frames, start), window frames
+    context .. len-context-1 replace the video's frames from start + context on (scaled to the video's size), blended
+    into the original over `blend` frames at each edge. Every other frame and the sound stay as they are."""
     p = probe(path)
     fps, W, H = p["fps"], p["width"] - p["width"] % 2, p["height"] - p["height"] % 2
-    lo, hi = start + context, start + len(frames) - context
+    spans = [(start + context, start + len(fr) - context, start, fr) for fr, start in windows if start >= 0]
     wave = read_audio(path, 0.0, p["frames"] / float(fps)) if p["audio"] else None
     out, vs, oa = _open_writer(out_path, fps, W, H, crf, preset, audio=wave is not None)
     try:
         for i, a in enumerate(iter_frames(path)):
             a = a[:H, :W]
-            if lo <= i < hi:
-                g = _cover(np.asarray(frames[i - start]), W, H).astype(np.float32)
-                k = min(i - lo + 1, hi - i)  # 1 at the edges
-                t = min(1.0, k / float(blend + 1)) if blend else 1.0
-                a = np.clip(g * t + a.astype(np.float32) * (1 - t), 0, 255).astype(np.uint8)
+            for lo, hi, start, fr in spans:
+                if lo <= i < hi:
+                    g = _cover(np.asarray(fr[i - start]), W, H).astype(np.float32)
+                    k = min(i - lo + 1, hi - i)  # 1 at the edges
+                    t = min(1.0, k / float(blend + 1)) if blend else 1.0
+                    a = np.clip(g * t + a.astype(np.float32) * (1 - t), 0, 255).astype(np.uint8)
             _put(out, vs, a, i)
         for pk in vs.encode():
             out.mux(pk)
@@ -394,7 +428,7 @@ def seam_splice(path, out_path, frames, start, context=9, blend=3, crf=12, prese
             _write_audio(out, oa, wave)
     finally:
         out.close()
-    return {"replaced": [lo, hi], "blend": blend}
+    return {"replaced": [[lo, hi] for lo, hi, _, _ in spans], "blend": blend}
 
 
 if __name__ == "__main__":  # offline: python extend_core.py join SRC OUT --after A [--before B] ...

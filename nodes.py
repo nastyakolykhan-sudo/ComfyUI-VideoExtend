@@ -261,15 +261,12 @@ class VideoExtendSeamSplice:
         if not (any and any[0]):
             return (video,)
         context, blend = int(context[0]), int(blend[0])
-        path = _as_file(video)
-        for f, start in zip(frames, starts):
-            if start < 0:
-                continue
-            out = _temp("extend_seam")
-            arr = (f.clamp(0, 1) * 255).round().byte().cpu().numpy()
-            ec.seam_splice(path, out, arr, int(start), context, blend)
-            path = out
-        return (VideoFromFile(path),)
+        wins = [((f.clamp(0, 1) * 255).round().byte().cpu().numpy(), int(s)) for f, s in zip(frames, starts) if s >= 0]
+        if not wins:
+            return (video,)
+        out = _temp("extend_seam")
+        ec.seam_splice(_as_file(video), out, wins, context, blend)
+        return (VideoFromFile(out),)
 
 
 NODE_CLASS_MAPPINGS = {
