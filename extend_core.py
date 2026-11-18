@@ -311,8 +311,90 @@ def join(source, out_path, before=(), after=(), before_reversed=False, drop_befo
         out.close()
     report["frames"] = pts
     report["seconds"] = round(pts / float(fps), 3)
+    # every place two pieces meet: between before parts, before part / source, source / after part, after parts
+    seams, at = [], 0
+    blens = [len(p["picks"]) for p in (reversed(bplans) if before_reversed else bplans)]
+    for k in blens:
+        at += k
+        seams.append(at)
+    at = report["source_at"] + sp["frames"]
+    if aplans:
+        seams.append(at)
+        for p in aplans[:-1]:
+            at += len(p["picks"])
+            seams.append(at)
+    report["seams"] = seams
     report["audio"] = has_audio
     return report
+
+
+# ------------------------------------------------------------------------------------------------------ seam repair
+
+def gen_size(W, H, pixels, multiple=32):
+    """A size of about `pixels` area with the clip's shape, sides multiples of `multiple`, never above the clip."""
+    s = min(1.0, math.sqrt(pixels / float(W * H)))
+    return max(multiple, int(round(W * s / multiple)) * multiple), max(multiple, int(round(H * s / multiple)) * multiple)
+
+
+def _small_gray(a, w=160):
+    h = max(1, int(round(a.shape[0] * w / a.shape[1])))
+    return np.asarray(Image.fromarray(a).convert("L").resize((w, h), Image.BILINEAR), np.float32)
+
+
+def seam_window(path, seam, context=9, gap=23, pixels=921600):
+    """Frames around a join, for a model that regenerates the `gap` frames centred on it from `context` frames kept
+    on each side (window = 2 * context + gap frames, e.g. 9 + 23 + 9 = 41 = 8n + 1 for LTX).
+
+    seam: index of the first frame after the join (-1 = no join). Returns frames (uint8, gen size), width, height,
+    fps, start (first window frame, -1 when the window doesn't fit) and jump: the frame change across the join over
+    the median change of the other frames in the window (about 1 = invisible, 2 = a visible jump)."""
+    p = probe(path)
+    n, fps = p["frames"], p["fps"]
+    W, H = gen_size(p["width"], p["height"], pixels)
+    total = 2 * context + gap
+    start = seam - context - gap // 2
+    if seam <= 0 or start < 0 or start + total > n:
+        return np.zeros((1, H, W, 3), np.uint8), W, H, fps, -1, 0.0
+    frames, smalls = [], []
+    for i, a in enumerate(iter_frames(path)):
+        if i >= start + total:
+            break
+        if i >= start:
+            frames.append(np.asarray(Image.fromarray(a).resize((W, H), Image.LANCZOS)))
+            smalls.append(_small_gray(a))
+    diffs = [float(np.mean(np.abs(smalls[i] - smalls[i - 1]))) for i in range(1, len(smalls))]
+    k = seam - start - 1  # diffs[k] = change from frame seam-1 to frame seam
+    others = [d for j, d in enumerate(diffs) if j != k]
+    base = float(np.median(others)) if others else 0.0
+    jump = diffs[k] / max(base, 0.25) if diffs else 0.0
+    return np.stack(frames), W, H, fps, start, round(jump, 3)
+
+
+def seam_splice(path, out_path, frames, start, context=9, blend=3, crf=12, preset="fast"):
+    """Put regenerated frames back: window frames context .. len-context-1 replace the video's frames from
+    start + context on (scaled to the video's size), blended into the original over `blend` frames at each edge.
+    Every other frame and the sound stay as they are."""
+    p = probe(path)
+    fps, W, H = p["fps"], p["width"] - p["width"] % 2, p["height"] - p["height"] % 2
+    lo, hi = start + context, start + len(frames) - context
+    wave = read_audio(path, 0.0, p["frames"] / float(fps)) if p["audio"] else None
+    out, vs, oa = _open_writer(out_path, fps, W, H, crf, preset, audio=wave is not None)
+    try:
+        for i, a in enumerate(iter_frames(path)):
+            a = a[:H, :W]
+            if lo <= i < hi:
+                g = _cover(np.asarray(frames[i - start]), W, H).astype(np.float32)
+                k = min(i - lo + 1, hi - i)  # 1 at the edges
+                t = min(1.0, k / float(blend + 1)) if blend else 1.0
+                a = np.clip(g * t + a.astype(np.float32) * (1 - t), 0, 255).astype(np.uint8)
+            _put(out, vs, a, i)
+        for pk in vs.encode():
+            out.mux(pk)
+        if wave is not None:
+            _write_audio(out, oa, wave)
+    finally:
+        out.close()
+    return {"replaced": [lo, hi], "blend": blend}
 
 
 if __name__ == "__main__":  # offline: python extend_core.py join SRC OUT --after A [--before B] ...

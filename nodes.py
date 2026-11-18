@@ -129,10 +129,11 @@ class VideoExtendJoin:
             },
         }
 
-    RETURN_TYPES = ("VIDEO", "STRING")
-    RETURN_NAMES = ("video", "report")
+    RETURN_TYPES = ("VIDEO", "STRING", "STRING")
+    RETURN_NAMES = ("video", "report", "seams")
     OUTPUT_TOOLTIPS = ("before + source + after at the source's size and frame rate, H.264 (crf 12), with sound.",
-                       "JSON: frames and seconds per part, where the source starts, the output length.")
+                       "JSON: frames and seconds per part, where the source starts, the output length.",
+                       "Frame index of every join (first frame after it), comma-separated; for Extend Seam Windows.")
     FUNCTION = "join"
     CATEGORY = CATEGORY
     DESCRIPTION = ("Join generated clips before and/or after a video. Each part is matched to the source's frame rate "
@@ -162,20 +163,126 @@ class VideoExtendJoin:
 
         before, after = side("before", add_before, before_parts), side("after", add_after, after_parts)
         if not before and not after:
-            return (source, json.dumps({"note": "nothing to add"}))
+            return (source, json.dumps({"note": "nothing to add"}), "")
         out = _temp("extend_join")
         report = ec.join(_as_file(source), out, before, after, bool(before_reversed), int(drop_before_last),
                          int(drop_after_first), float(max_seconds))
-        return (VideoFromFile(out), json.dumps(report))
+        return (VideoFromFile(out), json.dumps(report), ",".join(str(x) for x in report["seams"]))
+
+
+class VideoExtendSeamWindows:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("VIDEO", {"tooltip": "The joined video (Extend Join)."}),
+                "seams": ("STRING", {"default": "", "forceInput": True,
+                          "tooltip": "Frame indices of the joins, comma-separated (Extend Join's seams)."}),
+                "mode": (["auto", "always", "off"], {"default": "auto",
+                         "tooltip": "auto: only joins whose jump is above the threshold. always: every join. off: none."}),
+                "threshold": ("FLOAT", {"default": 1.4, "min": 1.0, "max": 10.0, "step": 0.05,
+                              "tooltip": "Frame change across the join over the usual change around it; about 1 is "
+                                         "invisible, 2 a clear jump."}),
+                "context": ("INT", {"default": 9, "min": 1, "max": 49,
+                            "tooltip": "Frames kept on each side as guides (8n + 1 for LTX: 9, 17, ...)."}),
+                "gap": ("INT", {"default": 23, "min": 1, "max": 97,
+                        "tooltip": "Frames regenerated across the join. 2 x context + gap must be 8n + 1 for LTX "
+                                   "(9 + 23 + 9 = 41)."}),
+                "pixels": ("INT", {"default": 921600, "min": 65536, "max": 8294400, "step": 1024,
+                           "tooltip": "Area of the windows (921600 = 1280x720), the clip's shape, sides multiples of 32."}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "INT", "BOOLEAN", "INT", "INT", "INT", "FLOAT", "INT", "INT", "STRING")
+    RETURN_NAMES = ("windows", "starts", "any", "width", "height", "frames", "fps", "fps_int", "guide_at", "report")
+    OUTPUT_IS_LIST = (True, True, False, False, False, False, False, False, False, False)
+    OUTPUT_TOOLTIPS = ("One frame batch per join to repair (a list: nodes after it run once per join).",
+                       "Where each window starts in the video (a list, same order).",
+                       "Whether any join needs repair.", "Window width.", "Window height.",
+                       "Frames per window (2 x context + gap).", "Frame rate.", "Frame rate, rounded.",
+                       "Index of the second guide (frames - context).", "JSON: every join, its jump and whether it is repaired.")
+    FUNCTION = "windows"
+    CATEGORY = CATEGORY
+    DESCRIPTION = ("Find the joins worth repairing and cut a window of frames around each: guides on both sides and the "
+                   "frames in between for a model (e.g. LTX with two guides) to regenerate. Measures each join's jump.")
+
+    def windows(self, video, seams, mode, threshold, context, gap, pixels):
+        path = _as_file(video)
+        idx = [int(x) for x in str(seams or "").replace(" ", "").split(",") if x.strip().lstrip("-").isdigit()]
+        wins, starts, rows, W, H, fps = [], [], [], 64, 64, 24.0
+        for s in idx:
+            fr, W, H, f, start, jump = ec.seam_window(path, s, context, gap, pixels)
+            fps = float(f)
+            fix = start >= 0 and mode != "off" and (mode == "always" or jump > threshold)
+            rows.append({"seam": s, "jump": jump, "repair": fix, "start": start})
+            if fix:
+                wins.append(torch.from_numpy(fr.astype(np.float32) / 255.0))
+                starts.append(start)
+        n = 2 * context + gap
+        anyfix = bool(wins)
+        if not anyfix:  # a placeholder so the list is never empty; nothing downstream runs (lazy splice)
+            wins, starts = [torch.zeros((n, H, W, 3))], [-1]
+        return (wins, starts, anyfix, W, H, n, fps, max(1, int(round(fps))), n - context, json.dumps(rows))
+
+
+class VideoExtendSeamSplice:
+    INPUT_IS_LIST = True
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("VIDEO",),
+                "starts": ("INT", {"forceInput": True, "tooltip": "Extend Seam Windows' starts."}),
+                "any": ("BOOLEAN", {"forceInput": True, "tooltip": "Extend Seam Windows' any: nothing runs when false."}),
+                "context": ("INT", {"default": 9, "min": 1, "max": 49, "tooltip": "The same context as the windows."}),
+                "blend": ("INT", {"default": 3, "min": 0, "max": 24,
+                          "tooltip": "Frames over which the repaired part fades in and out of the original."}),
+            },
+            "optional": {
+                "frames": ("IMAGE", {"lazy": True, "tooltip": "The repaired windows (same order as starts); only run "
+                                                               "when a join needs repair."}),
+            },
+        }
+
+    RETURN_TYPES = ("VIDEO",)
+    FUNCTION = "splice"
+    CATEGORY = CATEGORY
+    DESCRIPTION = ("Put repaired windows back into the video at their places, blended into the original at the edges. "
+                   "Every other frame and the sound stay as they are.")
+
+    def check_lazy_status(self, video, starts, any, context, blend, frames=None):
+        if any and any[0] and (frames is None or all(f is None for f in frames)):
+            return ["frames"]
+        return []
+
+    def splice(self, video, starts, any, context, blend, frames=None):
+        video = video[0]
+        if not (any and any[0]):
+            return (video,)
+        context, blend = int(context[0]), int(blend[0])
+        path = _as_file(video)
+        for f, start in zip(frames, starts):
+            if start < 0:
+                continue
+            out = _temp("extend_seam")
+            arr = (f.clamp(0, 1) * 255).round().byte().cpu().numpy()
+            ec.seam_splice(path, out, arr, int(start), context, blend)
+            path = out
+        return (VideoFromFile(path),)
 
 
 NODE_CLASS_MAPPINGS = {
     "VideoExtendEdgeFrames": VideoExtendEdgeFrames,
     "VideoExtendSegment": VideoExtendSegment,
     "VideoExtendJoin": VideoExtendJoin,
+    "VideoExtendSeamWindows": VideoExtendSeamWindows,
+    "VideoExtendSeamSplice": VideoExtendSeamSplice,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "VideoExtendEdgeFrames": "Video Edge Frames",
     "VideoExtendSegment": "Extend Segment (Head / Tail)",
     "VideoExtendJoin": "Extend Join",
+    "VideoExtendSeamWindows": "Extend Seam Windows",
+    "VideoExtendSeamSplice": "Extend Seam Splice",
 }
