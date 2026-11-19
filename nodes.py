@@ -195,6 +195,8 @@ class VideoExtendSeamWindows:
 
     RETURN_TYPES = ("IMAGE", "INT", "BOOLEAN", "INT", "INT", "INT", "FLOAT", "INT", "INT", "STRING")
     RETURN_NAMES = ("windows", "starts", "any", "width", "height", "frames", "fps", "fps_int", "guide_at", "report")
+    # windows keep the clip's exact shape: scaled, then padded right/bottom to multiples of 32 (Extend Seam Splice
+    # undoes exactly that)
     OUTPUT_IS_LIST = (True, True, False, False, False, False, False, False, False, False)
     OUTPUT_TOOLTIPS = ("One frame batch per join to repair (a list: nodes after it run once per join).",
                        "Where each window starts in the video (a list, same order).",
@@ -235,9 +237,11 @@ class VideoExtendSeamSplice:
                 "video": ("VIDEO",),
                 "starts": ("INT", {"forceInput": True, "tooltip": "Extend Seam Windows' starts."}),
                 "any": ("BOOLEAN", {"forceInput": True, "tooltip": "Extend Seam Windows' any: nothing runs when false."}),
-                "context": ("INT", {"default": 9, "min": 1, "max": 49, "tooltip": "The same context as the windows."}),
-                "blend": ("INT", {"default": 3, "min": 0, "max": 24,
-                          "tooltip": "Frames over which the repaired part fades in and out of the original."}),
+                "context": ("INT", {"default": 9, "min": 1, "max": 49,
+                            "tooltip": "The same context as the windows: the repaired window fades in and out over "
+                                       "these guide frames, where it matches the original."}),
+                "pixels": ("INT", {"default": 921600, "min": 65536, "max": 8294400, "step": 1024,
+                           "tooltip": "The same pixels as the windows (to undo their scaling exactly)."}),
             },
             "optional": {
                 "frames": ("IMAGE", {"lazy": True, "tooltip": "The repaired windows (same order as starts); only run "
@@ -251,21 +255,21 @@ class VideoExtendSeamSplice:
     DESCRIPTION = ("Put repaired windows back into the video at their places, blended into the original at the edges. "
                    "Every other frame and the sound stay as they are.")
 
-    def check_lazy_status(self, video, starts, any, context, blend, frames=None):
+    def check_lazy_status(self, video, starts, any, context, pixels, frames=None):
         if any and any[0] and (frames is None or all(f is None for f in frames)):
             return ["frames"]
         return []
 
-    def splice(self, video, starts, any, context, blend, frames=None):
+    def splice(self, video, starts, any, context, pixels, frames=None):
         video = video[0]
         if not (any and any[0]):
             return (video,)
-        context, blend = int(context[0]), int(blend[0])
+        context, pixels = int(context[0]), int(pixels[0])
         wins = [((f.clamp(0, 1) * 255).round().byte().cpu().numpy(), int(s)) for f, s in zip(frames, starts) if s >= 0]
         if not wins:
             return (video,)
         out = _temp("extend_seam")
-        ec.seam_splice(_as_file(video), out, wins, context, blend)
+        ec.seam_splice(_as_file(video), out, wins, context, pixels)
         return (VideoFromFile(out),)
 
 

@@ -364,9 +364,24 @@ def join(source, out_path, before=(), after=(), before_reversed=False, drop_befo
 # ------------------------------------------------------------------------------------------------------ seam repair
 
 def gen_size(W, H, pixels, multiple=32):
-    """A size of about `pixels` area with the clip's shape, sides multiples of `multiple`, never above the clip."""
+    """The clip scaled to about `pixels` area keeping its exact shape (sw x sh, never above the clip), and the canvas
+    it sits on (gw x gh, padded right and bottom to multiples of `multiple`). Returns gw, gh, sw, sh."""
     s = min(1.0, math.sqrt(pixels / float(W * H)))
-    return max(multiple, int(round(W * s / multiple)) * multiple), max(multiple, int(round(H * s / multiple)) * multiple)
+    sw, sh = max(2, int(round(W * s))), max(2, int(round(H * s)))
+    gw, gh = -(-sw // multiple) * multiple, -(-sh // multiple) * multiple
+    return gw, gh, sw, sh
+
+
+def _to_canvas(a, gw, gh, sw, sh):
+    """Scale to sw x sh (Lanczos, same shape as the clip) and pad to gw x gh by repeating the edge pixels."""
+    im = np.asarray(Image.fromarray(a).resize((sw, sh), Image.LANCZOS))
+    return np.pad(im, ((0, gh - sh), (0, gw - sw), (0, 0)), mode="edge")
+
+
+def _from_canvas(g, W, H, sw, sh):
+    """The exact inverse of _to_canvas: drop the padding, scale back to W x H."""
+    g = np.asarray(g)[:sh, :sw]
+    return np.asarray(Image.fromarray(g).resize((W, H), Image.LANCZOS))
 
 
 def _small_gray(a, w=160):
@@ -383,7 +398,7 @@ def seam_window(path, seam, context=9, gap=23, pixels=921600):
     the median change of the other frames in the window (about 1 = invisible, 2 = a visible jump)."""
     p = probe(path)
     n, fps = p["frames"], p["fps"]
-    W, H = gen_size(p["width"], p["height"], pixels)
+    W, H, sw, sh = gen_size(p["width"], p["height"], pixels)
     total = 2 * context + gap
     start = seam - context - gap // 2
     if seam <= 0 or start < 0 or start + total > n:
@@ -393,7 +408,7 @@ def seam_window(path, seam, context=9, gap=23, pixels=921600):
         if i >= start + total:
             break
         if i >= start:
-            frames.append(np.asarray(Image.fromarray(a).resize((W, H), Image.LANCZOS)))
+            frames.append(_to_canvas(a, W, H, sw, sh))
             smalls.append(_small_gray(a))
     diffs = [float(np.mean(np.abs(smalls[i] - smalls[i - 1]))) for i in range(1, len(smalls))]
     k = seam - start - 1  # diffs[k] = change from frame seam-1 to frame seam
@@ -403,23 +418,29 @@ def seam_window(path, seam, context=9, gap=23, pixels=921600):
     return np.stack(frames), W, H, fps, start, round(jump, 3)
 
 
-def seam_splice(path, out_path, windows, context=9, blend=3, crf=12, preset="fast"):
-    """Put regenerated windows back, all in one pass (one encode): for each (frames, start), window frames
-    context .. len-context-1 replace the video's frames from start + context on (scaled to the video's size), blended
-    into the original over `blend` frames at each edge. Every other frame and the sound stay as they are."""
+def seam_splice(path, out_path, windows, context=9, pixels=921600, crf=12, preset="fast"):
+    """Put regenerated windows back, all in one pass (one encode). Each window (frames, start) covers the video's
+    frames start .. start + len - 1 and is mapped back exactly (padding dropped, scaled to the video's size). The
+    regenerated gap replaces the original; over the guide frames on each side, where the model reproduces the
+    original, it fades in and out (no double image in the gap). Every other frame and the sound stay as they are."""
     p = probe(path)
     fps, W, H = p["fps"], p["width"] - p["width"] % 2, p["height"] - p["height"] % 2
-    spans = [(start + context, start + len(fr) - context, start, fr) for fr, start in windows if start >= 0]
+    _, _, sw, sh = gen_size(p["width"], p["height"], pixels)
+    spans = [(start, start + len(fr), fr) for fr, start in windows if start >= 0]
     wave = read_audio(path, 0.0, p["frames"] / float(fps)) if p["audio"] else None
     out, vs, oa = _open_writer(out_path, fps, W, H, crf, preset, audio=wave is not None)
     try:
         for i, a in enumerate(iter_frames(path)):
             a = a[:H, :W]
-            for lo, hi, start, fr in spans:
+            for lo, hi, fr in spans:
                 if lo <= i < hi:
-                    g = _cover(np.asarray(fr[i - start]), W, H).astype(np.float32)
-                    k = min(i - lo + 1, hi - i)  # 1 at the edges
-                    t = min(1.0, k / float(blend + 1)) if blend else 1.0
+                    j, n = i - lo, hi - lo
+                    t = 1.0
+                    if j < context:
+                        t = (j + 1) / float(context + 1)
+                    elif j >= n - context:
+                        t = (n - j) / float(context + 1)
+                    g = _from_canvas(fr[j], W, H, sw, sh).astype(np.float32)
                     a = np.clip(g * t + a.astype(np.float32) * (1 - t), 0, 255).astype(np.uint8)
             _put(out, vs, a, i)
         for pk in vs.encode():
@@ -428,7 +449,7 @@ def seam_splice(path, out_path, windows, context=9, blend=3, crf=12, preset="fas
             _write_audio(out, oa, wave)
     finally:
         out.close()
-    return {"replaced": [[lo, hi] for lo, hi, _, _ in spans], "blend": blend}
+    return {"replaced": [[lo, hi] for lo, hi, _ in spans]}
 
 
 if __name__ == "__main__":  # offline: python extend_core.py join SRC OUT --after A [--before B] ...
