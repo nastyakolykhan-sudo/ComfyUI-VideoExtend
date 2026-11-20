@@ -690,14 +690,14 @@ def join_v2(source, out_path, before=(), after=(), before_reversed=False, drop_b
             w0 = max(r0, at - Wn)
             gen = [need[i] for i in range(at - 1, w0 - 1, -1)]
             ref = [need[i] for i in range(at, min(n_total, at + 8))]
-            new, inf, Dg = sm.fix_window(gen, ref, float(fps), med)
-            repl[side] = {"win": (w0, at), "frames": new[::-1], "rest": (r0, w0), "Dg": Dg}
+            new, inf, Dg, amt = sm.fix_window(gen, ref, float(fps), med)
+            repl[side] = {"win": (w0, at), "frames": new[::-1], "rest": (r0, w0), "Dg": Dg, "sharpen": amt}
         else:
             w1 = min(r1, at + Wn)
             gen = [need[i] for i in range(at, w1)]
             ref = [need[i] for i in range(at - 1, max(-1, at - 9), -1)]
-            new, inf, Dg = sm.fix_window(gen, ref, float(fps), med)
-            repl[side] = {"win": (at, w1), "frames": new, "rest": (w1, r1), "Dg": Dg}
+            new, inf, Dg, amt = sm.fix_window(gen, ref, float(fps), med)
+            repl[side] = {"win": (at, w1), "frames": new, "rest": (w1, r1), "Dg": Dg, "sharpen": amt}
         inf["side"] = side
         info.append(inf)
     need.clear()
@@ -706,8 +706,18 @@ def join_v2(source, out_path, before=(), after=(), before_reversed=False, drop_b
     delta = {s: len(r["frames"]) - (r["win"][1] - r["win"][0]) for s, r in repl.items()}
     out, vs, oa = _open_writer(out_path, fps, W, H, crf, preset, audio=has_audio)
     pts = 0
+    # the source's own frames are taken from the source file (no second encode); only its dissolved ends (overlap)
+    # come from pass A
+    s_lo, s_hi = src_at + Kb, src_at + sp["frames"] - Ka
+    src_it = (a[:H, :W] for a in iter_frames(source))
+    for _ in range(Kb):
+        next(src_it, None)
     try:
         for i, a in enumerate(iter_frames(target)):
+            if s_lo <= i < s_hi:
+                b = next(src_it, None)
+                _put(out, vs, a if b is None else b, pts); pts += 1
+                continue
             emitted = False
             for s, r in repl.items():
                 w0, w1 = r["win"]
@@ -719,7 +729,8 @@ def join_v2(source, out_path, before=(), after=(), before_reversed=False, drop_b
                     break
                 q0, q1 = r["rest"]
                 if q0 <= i < q1:
-                    _put(out, vs, np.clip(a.astype(np.float32) + r["Dg"] + 0.5, 0, 255).astype(np.uint8), pts); pts += 1
+                    g = np.clip(a.astype(np.float32) + r["Dg"] + 0.5, 0, 255).astype(np.uint8)
+                    _put(out, vs, sm.sharpen(g, r["sharpen"]) if r["sharpen"] else g, pts); pts += 1
                     emitted = True
                     break
             if not emitted:

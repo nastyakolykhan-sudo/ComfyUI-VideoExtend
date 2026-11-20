@@ -31,7 +31,7 @@ DUP = 0.25            # repeat: mean change below this share of the clip's usual
 LOOK = 4              # repeats are looked for in the first frames only
 EASE_S = 0.75         # speed ramp length
 EASE_MIN = 1.15       # only re-time when the speeds differ by more than this
-RATIO_MAX = 1.8
+RATIO_MAX = 1.5
 ALIGN = 0.8           # share of the flow pulled at the join
 ALIGN_FADE_S = 0.5
 ALIGN_TOL = 1.5       # px of forward-backward flow mismatch tolerated
@@ -43,6 +43,12 @@ CAM_S = 1.0
 CAM_RELAX_S = 3.0
 CAM_CAP_SCALE = 0.05
 CAM_CAP_PX = 48.0
+CAM_MIN_SCALE = 0.98   # a zoom-out correction (the part framed tighter than the source) may go down to this; the
+                       # thin edge it opens is filled by mirroring and closes as the correction relaxes
+CAM_BORDER = 0.012     # share of the frame that may open at an edge (mirrored) before a zoom-in margin is used
+CAM_MARGIN_STEP = 0.001  # the anti-border zoom grows by at most 0.1% per frame (no zoom pop at the join)
+SHARPEN_MIN = 1.08    # detail: sharpen the generated part when the source has this much more fine detail
+SHARPEN_MAX = 0.5     # largest unsharp-mask amount
 WINDOW_S = CAM_S + CAM_RELAX_S + 0.5   # generated frames held per join
 
 
@@ -166,13 +172,23 @@ def _camera(fr, ref, fps, info):
         C = np.clip(C + cos_w(k, N) * (v_s - v_g), -lim, lim)
         Cs.append(C.copy())
     H, W = fr[0].shape[:2]
-    out = []
+    out, m = [], 1.0
     for j, x in enumerate(fr):
         c = Cs[j] if j < len(Cs) else Cs[-1] * max(0.0, 1.0 - (j - len(Cs) + 1) / float(max(1, Rx)))
-        if np.abs(c).max() < 1e-4:
+        if np.abs(c).max() < 1e-4 and m <= 1.0 + 1e-6:
             out.append(x); continue
-        S = float(np.exp(c[0])); dx, dy = float(c[1]), float(c[2])
-        S = max(S, 1 + 2 * abs(dx) / W, 1 + 2 * abs(dy) / H)
+        dx, dy = float(c[1]), float(c[2])
+        S = max(float(np.exp(c[0])), CAM_MIN_SCALE)
+        # an edge up to CAM_BORDER of the frame may open (filled by mirroring); beyond that a zoom-in margin covers
+        # it, and that margin may only grow or shrink slowly, so nothing pops at the join
+        bx, by = CAM_BORDER * W, CAM_BORDER * H
+        ux = (1 - S) * W / 2 + abs(dx) - bx
+        uy = (1 - S) * H / 2 + abs(dy) - by
+        need = max(1.0, 1 + 2 * max(0.0, ux) / W, 1 + 2 * max(0.0, uy) / H)
+        m = min(need, m + CAM_MARGIN_STEP) if need > m else max(need, m - CAM_MARGIN_STEP)
+        S = S * m
+        lim_x = max(0.0, (S - 1) * W / 2 + bx); lim_y = max(0.0, (S - 1) * H / 2 + by)
+        dx = float(np.clip(dx, -lim_x, lim_x)); dy = float(np.clip(dy, -lim_y, lim_y))
         M = np.float32([[S, 0, (1 - S) * W / 2 + dx], [0, S, (1 - S) * H / 2 + dy]])
         out.append(cv2.warpAffine(x, M, (W, H), flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REFLECT))
     Ca = np.array(Cs)
@@ -202,9 +218,12 @@ def fix_window(fr, ref, fps, motion_median):
         fast = mean > MAX_SPEED or peak > MAX_PEAK
         info["motion_px"] = [round(float(mean), 1), round(float(peak), 1)]
         info["flow_steps"] = "off (fast motion)" if fast else "on"
-        if not fast:
-            # 2. camera
+        # 2. camera: fitted on the background, so only a fast-moving whole frame turns it off
+        if mean <= MAX_SPEED:
             fr = _camera(fr, ref, fps, info)
+        else:
+            info["camera"] = "off (fast motion)"
+        if not fast:
             # 3. speed
             vr = np.median([m[0] for m in mr]); vg = np.median([m[0] for m in mg])
             R = float(np.clip(vr / max(vg, 1e-3), 1 / RATIO_MAX, RATIO_MAX)) if vg > 0.3 else 1.0
@@ -251,4 +270,26 @@ def fix_window(fr, ref, fps, motion_median):
     fr = [np.clip(x.astype(np.float32) + Dg + (D - Dg) * cos_w(j, N) + 0.5, 0, 255).astype(np.uint8)
           for j, x in enumerate(fr)]
     info["colour_offset"] = [round(float(v), 2) for v in Dg]
-    return fr, info, Dg
+    # 6. detail: a generated part softer than the source gets a matched unsharp mask (kept for the whole part)
+    amt = 0.0
+    if cv2 is not None:
+        hs = np.mean([detail(x) for x in ref[:e]]); hg = np.mean([detail(x) for x in fr[:e]])
+        r = hs / max(hg, 1e-3)
+        if r > SHARPEN_MIN:
+            amt = float(min(SHARPEN_MAX, r - 1.0))
+            fr = [sharpen(x, amt) for x in fr]
+        info["detail_ratio"] = round(float(r), 2)
+    info["sharpen"] = round(amt, 2)
+    return fr, info, Dg, amt
+
+
+def detail(f):
+    g = cv2.cvtColor(f, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    return float(np.abs(cv2.Laplacian(g, cv2.CV_32F)).mean())
+
+
+def sharpen(f, amt, sigma=1.2):
+    if amt <= 0:
+        return f
+    x = f.astype(np.float32)
+    return np.clip(x + amt * (x - cv2.GaussianBlur(x, (0, 0), sigma)) + 0.5, 0, 255).astype(np.uint8)
