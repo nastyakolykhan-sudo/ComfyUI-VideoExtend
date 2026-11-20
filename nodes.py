@@ -42,6 +42,12 @@ def _image(a):
     return torch.from_numpy(np.asarray(a, np.float32) / 255.0)[None]
 
 
+def _always(*args, **kwargs):
+    """The node writes its result to ComfyUI's temp folder, which a server may clear between jobs: never reuse a
+    cached result (its file can be gone), always run again (cheap)."""
+    return float("nan")
+
+
 class VideoExtendEdgeFrames:
     @classmethod
     def INPUT_TYPES(cls):
@@ -65,6 +71,7 @@ class VideoExtendEdgeFrames:
 
 
 class VideoExtendSegment:
+    IS_CHANGED = classmethod(_always)
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -97,6 +104,7 @@ class VideoExtendSegment:
 
 
 class VideoExtendJoin:
+    IS_CHANGED = classmethod(_always)
     @classmethod
     def INPUT_TYPES(cls):
         lazy = {"lazy": True}
@@ -188,6 +196,7 @@ class VideoExtendJoin:
 
 
 class VideoExtendSeamWindows:
+    IS_CHANGED = classmethod(_always)
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -245,6 +254,7 @@ class VideoExtendSeamWindows:
 
 
 class VideoExtendSeamSplice:
+    IS_CHANGED = classmethod(_always)
     INPUT_IS_LIST = True
 
     @classmethod
