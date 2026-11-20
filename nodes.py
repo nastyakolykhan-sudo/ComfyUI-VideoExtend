@@ -126,6 +126,16 @@ class VideoExtendJoin:
             "optional": {
                 **{f"before_{i}": ("VIDEO", lazy) for i in range(1, STEPS + 1)},
                 **{f"after_{i}": ("VIDEO", lazy) for i in range(1, STEPS + 1)},
+                "overlap_before": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 5.0, "step": 0.05,
+                                   "tooltip": "Seconds each before part repeats of the piece next to it (a model that "
+                                              "returns its input + the new footage, sliced that much early). The two "
+                                              "copies are cross-dissolved instead of cut. 0 = cut."}),
+                "overlap_after": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 5.0, "step": 0.05,
+                                  "tooltip": "The same for the after parts."}),
+                "smooth_joins": ("BOOLEAN", {"default": False,
+                                 "tooltip": "Smooth every join with the source that is cut (no overlap), on the "
+                                            "generated side only: repeated frames, camera motion, speed, alignment "
+                                            "and colour. The source's frames stay as they are."}),
             },
         }
 
@@ -142,7 +152,8 @@ class VideoExtendJoin:
                    "run (lazy inputs).")
 
     def check_lazy_status(self, source, add_before, add_after, before_parts, after_parts, before_reversed=False,
-                          drop_before_last=0, drop_after_first=0, max_seconds=0.0, **parts):
+                          drop_before_last=0, drop_after_first=0, max_seconds=0.0, overlap_before=0.0,
+                          overlap_after=0.0, smooth_joins=False, **parts):
         need = []
         if add_before:
             need += [f"before_{i}" for i in range(1, before_parts + 1) if parts.get(f"before_{i}") is None]
@@ -151,7 +162,8 @@ class VideoExtendJoin:
         return need
 
     def join(self, source, add_before, add_after, before_parts, after_parts, before_reversed=False,
-             drop_before_last=0, drop_after_first=0, max_seconds=0.0, **parts):
+             drop_before_last=0, drop_after_first=0, max_seconds=0.0, overlap_before=0.0, overlap_after=0.0,
+             smooth_joins=False, **parts):
         def side(name, on, n):
             if not on:
                 return []
@@ -165,8 +177,13 @@ class VideoExtendJoin:
         if not before and not after:
             return (source, json.dumps({"note": "nothing to add"}), "")
         out = _temp("extend_join")
-        report = ec.join(_as_file(source), out, before, after, bool(before_reversed), int(drop_before_last),
-                         int(drop_after_first), float(max_seconds))
+        if smooth_joins or overlap_before or overlap_after:
+            report = ec.join_v2(_as_file(source), out, before, after, bool(before_reversed), int(drop_before_last),
+                                int(drop_after_first), float(max_seconds), float(overlap_before or 0.0),
+                                float(overlap_after or 0.0), bool(smooth_joins), tmp_path=_temp("extend_join_a"))
+        else:
+            report = ec.join(_as_file(source), out, before, after, bool(before_reversed), int(drop_before_last),
+                             int(drop_after_first), float(max_seconds))
         return (VideoFromFile(out), json.dumps(report), ",".join(str(x) for x in report["seams"]))
 
 
@@ -273,12 +290,34 @@ class VideoExtendSeamSplice:
         return (VideoFromFile(out),)
 
 
+
+class VideoExtendAutoResolution:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"video": ("VIDEO",)}}
+
+    RETURN_TYPES = ("STRING", "INT")
+    RETURN_NAMES = ("resolution", "short_side")
+    OUTPUT_TOOLTIPS = ("480p, 720p or 1080p: the generation resolution nearest the clip (up to 600 px on the short "
+                       "side -> 480p, up to 900 -> 720p, larger -> 1080p).", "The clip's short side in px.")
+    FUNCTION = "pick"
+    CATEGORY = CATEGORY
+    DESCRIPTION = ("Picks the generation resolution from the clip itself, so the new footage is made as close to the "
+                   "clip's own sharpness as the models allow (1080p at most).")
+
+    def pick(self, video):
+        p = ec.probe(_as_file(video))
+        short = min(p["width"], p["height"])
+        res = "480p" if short <= 600 else "720p" if short <= 900 else "1080p"
+        return (res, int(short))
+
 NODE_CLASS_MAPPINGS = {
     "VideoExtendEdgeFrames": VideoExtendEdgeFrames,
     "VideoExtendSegment": VideoExtendSegment,
     "VideoExtendJoin": VideoExtendJoin,
     "VideoExtendSeamWindows": VideoExtendSeamWindows,
     "VideoExtendSeamSplice": VideoExtendSeamSplice,
+    "VideoExtendAutoResolution": VideoExtendAutoResolution,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "VideoExtendEdgeFrames": "Video Edge Frames",
@@ -286,4 +325,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VideoExtendJoin": "Extend Join",
     "VideoExtendSeamWindows": "Extend Seam Windows",
     "VideoExtendSeamSplice": "Extend Seam Splice",
+    "VideoExtendAutoResolution": "Extend Auto Resolution",
 }

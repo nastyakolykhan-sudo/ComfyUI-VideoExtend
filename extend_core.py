@@ -478,3 +478,277 @@ if __name__ == "__main__":  # offline: python extend_core.py join SRC OUT --afte
     else:
         print(json.dumps(join(a.src, a.out, a.before, a.after, a.before_reversed, a.drop_before_last,
                               a.drop_after_first, a.max_seconds), indent=1))
+
+
+# --------------------------------------------------------------------------------- join with hand-over / smoothing
+
+def _ease(t):
+    return 0.5 - 0.5 * math.cos(math.pi * t)
+
+
+def _part_frames(plan, W, H):
+    """A part's planned frames (matched to the output frame rate), scaled to cover W x H."""
+    want = plan["picks"]
+    need, cache, it_i, last = set(want), {}, 0, None
+    for i, a in enumerate(iter_frames(plan["path"])):
+        if i in need:
+            cache[i] = _cover(a, W, H)
+        while it_i < len(want) and want[it_i] in cache:
+            last = cache[want[it_i]]
+            yield last
+            if it_i + 1 >= len(want) or want[it_i + 1] != want[it_i]:
+                cache.pop(want[it_i], None)
+            it_i += 1
+        if it_i >= len(want):
+            return
+    while it_i < len(want) and last is not None:  # part ended early: hold its last frame
+        yield last
+        it_i += 1
+
+
+def _dissolve(a, b, al):
+    return np.clip((1 - al) * a.astype(np.float32) + al * b.astype(np.float32) + 0.5, 0, 255).astype(np.uint8)
+
+
+def join_v2(source, out_path, before=(), after=(), before_reversed=False, drop_before_last=0, drop_after_first=0,
+            max_seconds=0.0, overlap_before=0.0, overlap_after=0.0, smooth=False, fade=0.08, crf=12, preset="fast",
+            tmp_path=None):
+    """join() plus two options.
+
+    overlap_before / overlap_after (seconds): each part on that side starts (toward the source) with its own copy of
+    that many seconds of the piece next to it (Gemini returns its input + the new footage; slice it that much early).
+    The two copies are cross-dissolved over the overlap instead of cut, so the part continues from its own frames.
+    smooth: at every join with the source that has no overlap, the generated side is smoothed (extend_smooth: repeats,
+    camera, speed, align, colour); the source's frames are never changed. The sound stays in sync: a part that gets
+    shorter or longer loses or gains sound at its far end.
+    """
+    from collections import deque
+    try:
+        from . import extend_smooth as sm
+    except ImportError:  # run as a plain module (tests)
+        import extend_smooth as sm
+
+    sp = probe(source)
+    fps, W, H = sp["fps"], sp["width"] - sp["width"] % 2, sp["height"] - sp["height"] % 2
+    before, after = [p for p in before if p], [p for p in after if p]
+    Kb = int(round(float(overlap_before) * float(fps))) if before else 0
+    Ka = int(round(float(overlap_after) * float(fps))) if after else 0
+
+    def side_plans(paths, which, K):
+        backwards = which == "before" and not before_reversed
+        order = list(reversed(paths)) if backwards else list(paths)
+        plans, left = [], max_seconds or 0.0
+        ks = K / float(fps)
+        for i, path in enumerate(order):
+            touching = i == 0
+            if which == "after":
+                df, dl = (drop_after_first if touching else 0), 0
+            elif before_reversed:
+                df, dl = (drop_before_last if touching else 0), 0
+            else:
+                df, dl = 0, (drop_before_last if touching else 0)
+            plan = _part_plan(path, fps, df, dl, (left + ks) if max_seconds else 0.0, keep="end" if backwards else "start")
+            plans.append(plan)
+            if max_seconds:
+                left -= plan["seconds"] - ks
+                if left <= 1.0 / float(fps):
+                    break
+        return list(reversed(plans)) if backwards else plans
+
+    bplans, aplans = side_plans(before, "before", Kb), side_plans(after, "after", Ka)
+
+    # pieces in output order: (kind, frame iterator factory, frame count, k_next, audio plan)
+    pieces = []
+    if bplans and before_reversed:
+        seq = []
+        for k, plan in enumerate(bplans):            # generation order, reversed domain: step 1 touches the source
+            fr = [a for a in _part_frames(plan, W, H)]
+            if k > 0 and Kb and seq:
+                n = min(Kb, len(seq), len(fr))
+                tail = seq[-n:]; del seq[-n:]
+                seq += [_dissolve(tail[q], fr[q], _ease((q + 1) / (n + 1))) for q in range(n)]
+                fr = fr[n:]
+            seq += fr
+        seq = seq[::-1]
+        pieces.append({"kind": "before", "it": (lambda s=seq: iter(s)), "n": len(seq), "k": Kb, "plan": None,
+                       "silent": True})
+    else:
+        for i, plan in enumerate(bplans):
+            last = i == len(bplans) - 1
+            pieces.append({"kind": "before", "it": (lambda p=plan: _part_frames(p, W, H)), "n": len(plan["picks"]),
+                           "k": Kb, "plan": plan, "silent": False, "skip_end": Kb})
+    pieces.append({"kind": "source", "it": (lambda: (a[:H, :W] for a in iter_frames(source))), "n": sp["frames"],
+                   "k": Ka if aplans else 0, "plan": None})
+    for i, plan in enumerate(aplans):
+        pieces.append({"kind": "after", "it": (lambda p=plan: _part_frames(p, W, H)), "n": len(plan["picks"]),
+                       "k": Ka if i < len(aplans) - 1 else 0, "plan": plan, "silent": False, "skip_start": Ka})
+
+    # audio, one wave per piece, each the length (in output frames) that piece owns
+    has_audio = sp["audio"] or any(p["probe"]["audio"] for p in aplans) or \
+        (not before_reversed and any(p["probe"]["audio"] for p in bplans))
+    nf = int(round(fade * AUDIO_RATE))
+
+    def piece_wave(pc, own):
+        n = int(round(own / float(fps) * AUDIO_RATE))
+        if pc["kind"] == "source":
+            w = read_audio(source, 0.0, sp["frames"] / float(fps)) if sp["audio"] else None
+            return w if w is not None else np.zeros((2, n), np.float32)
+        plan = pc["plan"]
+        if pc.get("silent") or plan is None or not plan["probe"]["audio"]:
+            return np.zeros((2, n), np.float32)
+        start = plan["lo"] / float(plan["probe"]["fps"]) + pc.get("skip_start", 0) / float(fps)
+        w = read_audio(plan["path"], start, own / float(fps))
+        return _fade(w, nf, nf) if w is not None else np.zeros((2, n), np.float32)
+
+    # ---- pass A: every piece in order, overlaps dissolved
+    final_direct = not smooth
+    target = out_path if final_direct else (tmp_path or out_path + ".pass_a.mp4")
+    out, vs, oa = _open_writer(target, fps, W, H, crf if final_direct else 4, preset if final_direct else "ultrafast",
+                               audio=has_audio and final_direct)
+    pts = 0
+    layout = []
+    pending = []
+    try:
+        for i, pc in enumerate(pieces):
+            start = pts
+            it = pc["it"]()
+            k_prev = pieces[i - 1]["k"] if i else 0
+            for q in range(len(pending)):
+                b = next(it, None)
+                a = pending[q]
+                _put(out, vs, a if b is None else _dissolve(a, b, _ease((q + 1) / (len(pending) + 1))), pts); pts += 1
+            buf = deque()
+            for f in it:
+                buf.append(f)
+                if len(buf) > pc["k"]:
+                    _put(out, vs, buf.popleft(), pts); pts += 1
+            pending = list(buf)
+            layout.append({"kind": pc["kind"], "start": start, "end": pts, "overlap_in": k_prev})
+        for a in pending:
+            _put(out, vs, a, pts); pts += 1
+        if layout:
+            layout[-1]["end"] = pts
+        for p in vs.encode():
+            out.mux(p)
+        # owned lengths: a generated piece loses its overlap at the end that faces the source
+        si = [i for i, pc in enumerate(pieces) if pc["kind"] == "source"][0]
+        owns = []
+        for i, pc in enumerate(pieces):
+            if pc["kind"] == "source":
+                owns.append(pc["n"])
+            elif i < si:
+                owns.append(pc["n"] - pc["k"])
+            else:
+                owns.append(pc["n"] - pieces[i - 1]["k"])
+        waves = [piece_wave(pc, own) for pc, own in zip(pieces, owns)] if has_audio else []
+        if final_direct and has_audio:
+            wave = np.concatenate(waves, axis=1)
+            _write_audio(out, oa, _fit_len(wave, int(round(pts / float(fps) * AUDIO_RATE))))
+    finally:
+        out.close()
+
+    src_at = sum(owns[:si])
+    report = {"fps": str(fps), "size": [W, H], "source_frames": sp["frames"], "source_at": src_at,
+              "overlap_frames": {"before": Kb, "after": Ka},
+              "before": [{"frames": len(p["picks"]), "seconds": round(p["seconds"], 3)} for p in bplans],
+              "after": [{"frames": len(p["picks"]), "seconds": round(p["seconds"], 3)} for p in aplans]}
+    if final_direct:
+        report.update(frames=pts, seconds=round(pts / float(fps), 3), audio=has_audio,
+                      seams=[x for x in ([src_at] if bplans else []) + ([src_at + sp["frames"]] if aplans else [])])
+        return report
+
+    # ---- pass B: smooth the joins with the source that were cut (no overlap)
+    n_total = pts
+    jobs = []      # (side, region_start, region_end, at)
+    if bplans and not Kb:
+        b_last = [l for l in layout if l["kind"] == "before"][-1]
+        jobs.append(("before", b_last["start"], src_at, src_at))
+    if aplans and not Ka:
+        a_first = [l for l in layout if l["kind"] == "after"][0]
+        jobs.append(("after", src_at + sp["frames"], a_first["end"], src_at + sp["frames"]))
+    Wn = sm.window_frames(fps)
+    need = {}
+    for side, r0, r1, at in jobs:
+        if side == "before":
+            need.update({i: None for i in range(max(r0, at - Wn), at)})
+            need.update({i: None for i in range(at, min(n_total, at + 8))})
+        else:
+            need.update({i: None for i in range(at, min(r1, at + Wn))})
+            need.update({i: None for i in range(max(0, at - 8), at)})
+    grays, prev = [], None
+    for i, a in enumerate(iter_frames(target)):
+        if i in need:
+            need[i] = a
+        g = sm.small_gray(a)
+        if prev is not None:
+            grays.append(float(np.abs(g - prev).mean()))
+        prev = g
+    med = float(np.median(grays)) if grays else 1.0
+    repl, info = {}, []
+    for side, r0, r1, at in jobs:
+        if side == "before":
+            w0 = max(r0, at - Wn)
+            gen = [need[i] for i in range(at - 1, w0 - 1, -1)]
+            ref = [need[i] for i in range(at, min(n_total, at + 8))]
+            new, inf, Dg = sm.fix_window(gen, ref, float(fps), med)
+            repl[side] = {"win": (w0, at), "frames": new[::-1], "rest": (r0, w0), "Dg": Dg}
+        else:
+            w1 = min(r1, at + Wn)
+            gen = [need[i] for i in range(at, w1)]
+            ref = [need[i] for i in range(at - 1, max(-1, at - 9), -1)]
+            new, inf, Dg = sm.fix_window(gen, ref, float(fps), med)
+            repl[side] = {"win": (at, w1), "frames": new, "rest": (w1, r1), "Dg": Dg}
+        inf["side"] = side
+        info.append(inf)
+    need.clear()
+
+    # owned lengths after smoothing (a piece's change is taken at its far end, for the sound)
+    delta = {s: len(r["frames"]) - (r["win"][1] - r["win"][0]) for s, r in repl.items()}
+    out, vs, oa = _open_writer(out_path, fps, W, H, crf, preset, audio=has_audio)
+    pts = 0
+    try:
+        for i, a in enumerate(iter_frames(target)):
+            emitted = False
+            for s, r in repl.items():
+                w0, w1 = r["win"]
+                if w0 <= i < w1:
+                    if i == w0:
+                        for f in r["frames"]:
+                            _put(out, vs, f, pts); pts += 1
+                    emitted = True
+                    break
+                q0, q1 = r["rest"]
+                if q0 <= i < q1:
+                    _put(out, vs, np.clip(a.astype(np.float32) + r["Dg"] + 0.5, 0, 255).astype(np.uint8), pts); pts += 1
+                    emitted = True
+                    break
+            if not emitted:
+                _put(out, vs, a, pts); pts += 1
+        for p in vs.encode():
+            out.mux(p)
+        if has_audio:
+            ws = []
+            for k, (pc, w) in enumerate(zip(pieces, waves)):
+                d = 0
+                if pc["kind"] == "before" and k == si - 1:
+                    d = delta.get("before", 0)
+                elif pc["kind"] == "after" and k == si + 1:
+                    d = delta.get("after", 0)
+                if d:
+                    ds = int(round(abs(d) / float(fps) * AUDIO_RATE))
+                    if pc["kind"] == "before":
+                        w = w[:, ds:] if d < 0 else np.pad(w, ((0, 0), (ds, 0)))
+                    else:
+                        w = w[:, :max(0, w.shape[1] - ds)] if d < 0 else np.pad(w, ((0, 0), (0, ds)))
+                ws.append(w)
+            _write_audio(out, oa, _fit_len(np.concatenate(ws, axis=1), int(round(pts / float(fps) * AUDIO_RATE))))
+    finally:
+        out.close()
+        try:
+            os.remove(target)
+        except OSError:
+            pass
+    src_at2 = src_at + delta.get("before", 0)
+    report.update(frames=pts, seconds=round(pts / float(fps), 3), audio=has_audio, source_at=src_at2, smooth=info,
+                  seams=([src_at2] if bplans else []) + ([src_at2 + sp["frames"]] if aplans else []))
+    return report
