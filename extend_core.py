@@ -9,7 +9,7 @@ from fractions import Fraction
 
 import av
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 
 AUDIO_RATE = 48000
 
@@ -157,9 +157,27 @@ def pad_box(W, H):
     return cw, ch, (cw - W) // 2, (ch - H) // 2
 
 
+def pad_frame(a, box):
+    """a (H x W x 3 uint8) centred on a box = (canvas_w, canvas_h, x, y) canvas whose bars are a blurred, darkened copy
+    of the frame scaled to cover it (black bars made a model treat the clip as letterboxed and cut away)."""
+    cw, ch, x, y = box
+    H, W = a.shape[:2]
+    small = Image.fromarray(a).resize((max(8, W // 8), max(8, H // 8)), Image.BILINEAR)
+    sc = max(cw / float(small.width), ch / float(small.height))
+    bw, bh = int(math.ceil(small.width * sc)), int(math.ceil(small.height * sc))
+    bg = small.resize((bw // 8 + 1, bh // 8 + 1), Image.BILINEAR).filter(ImageFilter.GaussianBlur(2.5))
+    bg = bg.resize((bw, bh), Image.BILINEAR)
+    l, t = (bw - cw) // 2, (bh - ch) // 2
+    c = (np.asarray(bg, np.float32)[t:t + ch, l:l + cw] * 0.6).astype(np.uint8)
+    c = np.ascontiguousarray(c)
+    c[y:y + H, x:x + W] = a
+    return c
+
+
 def segment(src, out_path, part="tail", seconds=5.0, reverse=False, keep_audio=True, crf=12, preset="fast", pad=False):
     """The first (`head`) or last (`tail`) `seconds` of a clip (the whole clip when shorter), optionally played
-    backwards (audio is then dropped), optionally centred on a 16:9 / 9:16 canvas with black bars (pad_box).
+    backwards (audio is then dropped), optionally centred on a 16:9 / 9:16 canvas (pad_box) with blurred bars
+    (pad_frame).
     Returns its real length in seconds."""
     sp = probe(src)
     fps, n = sp["fps"], sp["frames"]
@@ -174,10 +192,7 @@ def segment(src, out_path, part="tail", seconds=5.0, reverse=False, keep_audio=T
         a = a[:H, :W]
         if box is None:
             return a
-        cw, ch, x, y = box
-        c = np.zeros((ch, cw, 3), np.uint8)
-        c[y:y + H, x:x + W] = a
-        return c
+        return pad_frame(a, box)
     audio = keep_audio and not reverse and sp["audio"]
     wave = read_audio(src, lo / float(fps), k / float(fps)) if audio else None
     OW, OH = (box[0], box[1]) if box else (W, H)
@@ -218,22 +233,47 @@ def _cover(a, W, H):
     return np.asarray(im)[y:y + H, x:x + W]
 
 
-def _part_plan(path, fps_out, drop_first, drop_last, max_seconds, keep="start"):
+def _part_plan(path, fps_out, drop_first, drop_last, max_seconds, keep="start", rate=1.0, hold_start=0, hold_end=0):
     """Which frames of a part are kept, and which of them land on each output frame (matched by time).
-    When max_seconds cuts the part, keep="start" keeps its beginning, keep="end" its end (a part before the source)."""
+    When max_seconds cuts the part, keep="start" keeps its beginning, keep="end" its end (a part before the source).
+    rate: playback speed (1 = as generated); the first hold_start / last hold_end output frames stay at 1 (a copy that
+    is dissolved with the piece next to it). With a rate, picks are fractional positions (blended in _part_frames)."""
     p = probe(path)
     n = p["frames"]
     lo, hi = min(drop_first, n - 1), max(min(drop_first, n - 1) + 1, n - drop_last)
-    if max_seconds and keep == "end":
-        lo = max(lo, hi - max(1, int(round(max_seconds * float(p["fps"])))))
-    kept = hi - lo
-    dur = kept / float(p["fps"])
-    if max_seconds and dur > max_seconds:
-        dur = max_seconds
-    m = max(1, int(round(dur * float(fps_out))))
     ratio = float(p["fps"]) / float(fps_out)
-    picks = [min(lo + kept - 1, lo + int(math.floor(j * ratio + 1e-6))) for j in range(m)]
-    return {"path": path, "probe": p, "lo": lo, "kept": kept, "picks": picks, "seconds": m / float(fps_out)}
+    if abs(rate - 1.0) < 1e-6:
+        if max_seconds and keep == "end":
+            lo = max(lo, hi - max(1, int(round(max_seconds * float(p["fps"])))))
+        kept = hi - lo
+        dur = kept / float(p["fps"])
+        if max_seconds and dur > max_seconds:
+            dur = max_seconds
+        m = max(1, int(round(dur * float(fps_out))))
+        picks = [min(lo + kept - 1, lo + int(math.floor(j * ratio + 1e-6))) for j in range(m)]
+        return {"path": path, "probe": p, "lo": lo, "kept": kept, "picks": picks, "seconds": m / float(fps_out),
+                "rate": 1.0}
+    # positions measured from the end that is kept (the start for keep="start", the end for keep="end")
+    span = (hi - lo) - 1
+    pos, j = [], 0
+    m_cap = int(round(max_seconds * float(fps_out))) if max_seconds else 10 ** 9
+    while len(pos) < m_cap:
+        x = j * ratio if j < hold_start else hold_start * ratio + (j - hold_start) * ratio * rate
+        if x > span + 1e-6:
+            break
+        pos.append(x); j += 1
+    if hold_end and len(pos) > hold_end:
+        # the last hold_end frames at 1 (a copy dissolved with the next part): re-space them from their start
+        b = len(pos) - hold_end
+        x0 = pos[b]
+        tail = [x0 + q * ratio for q in range(hold_end)]
+        pos = pos[:b] + [x for x in tail if x <= span + 1e-6]
+    if keep == "end":
+        pos = [span - x for x in reversed(pos)]
+    picks = [lo + x for x in pos]
+    lo2 = int(math.floor(min(picks))) if picks else lo
+    return {"path": path, "probe": p, "lo": lo2, "kept": hi - lo2, "picks": picks, "seconds": len(picks) / float(fps_out),
+            "rate": float(rate)}
 
 
 def _fade(wave, n_in, n_out):
@@ -513,25 +553,50 @@ def _ease(t):
 
 
 def _part_frames(plan, W, H):
-    """A part's planned frames (matched to the output frame rate), scaled to cover W x H."""
+    """A part's planned frames (matched to the output frame rate), scaled to cover W x H. A fractional pick (a part
+    played at another speed) blends its two neighbouring frames."""
     want = plan["picks"]
-    need, cache, it_i, last = set(want), {}, 0, None
+    if not want:
+        return
+    need = set()
+    for x in want:
+        need.add(int(math.floor(x))); need.add(int(math.ceil(x)))
+    cache, it_i, last = {}, 0, None
+
+    def ready(x):
+        return int(math.floor(x)) in cache and int(math.ceil(x)) in cache
+
+    def make(x):
+        i0, i1 = int(math.floor(x)), int(math.ceil(x))
+        w = x - i0
+        if i1 == i0 or w < 0.02:
+            return cache[i0]
+        if w > 0.98:
+            return cache[i1]
+        return _dissolve(cache[i0], cache[i1], w)
+
     for i, a in enumerate(iter_frames(plan["path"])):
         if i in need:
             cache[i] = _cover(a, W, H)
-        while it_i < len(want) and want[it_i] in cache:
-            last = cache[want[it_i]]
+        while it_i < len(want) and ready(want[it_i]):
+            last = make(want[it_i])
             yield last
-            if it_i + 1 >= len(want) or want[it_i + 1] != want[it_i]:
-                cache.pop(want[it_i], None)
             it_i += 1
+            lo_next = int(math.floor(want[it_i])) if it_i < len(want) else i + 1
+            for k in [k for k in cache if k < lo_next]:
+                cache.pop(k)
         if it_i >= len(want):
             return
-    while it_i < len(want) and last is not None:  # part ended early: hold its last frame
+    while it_i < len(want) and (last is not None or cache):  # part ended early: hold its last frame
+        if last is None:
+            last = cache[max(cache)]
         yield last
         it_i += 1
 
 
+SPEED_WIN = 2.0      # seconds measured on each side of a join for match_speed
+SPEED_MIN, SPEED_MAX = 1 / 1.5, 1.6   # playback rates match_speed may use
+SPEED_SKIP = 1.1     # rates closer to 1 than this are left alone
 HANDOVER_MAD = 5.0   # mean grey-level difference (160 px wide) above which a part's copy does not line up with the
                      # source (Gemini's own copy: about 1.5; a 1.33x reframed copy: 15+)
 
@@ -547,7 +612,7 @@ def _dissolve(a, b, al):
 
 def join_v2(source, out_path, before=(), after=(), before_reversed=False, drop_before_last=0, drop_after_first=0,
             max_seconds=0.0, overlap_before=0.0, overlap_after=0.0, smooth=False, fade=0.08, crf=12, preset="fast",
-            tmp_path=None):
+            tmp_path=None, match_speed=False):
     """join() plus two options.
 
     overlap_before / overlap_after (seconds): each part on that side starts (toward the source) with its own copy of
@@ -556,6 +621,11 @@ def join_v2(source, out_path, before=(), after=(), before_reversed=False, drop_b
     smooth: at every join with the source that has no overlap, the generated side is smoothed (extend_smooth: repeats,
     camera, speed, align, colour); the source's frames are never changed. The sound stays in sync: a part that gets
     shorter or longer loses or gains sound at its far end.
+    match_speed: each side is played at the source's speed (measured over SPEED_WIN seconds on each side of the
+    join: camera and in-frame motion), so footage a model made slower or faster than the clip does not change pace
+    where it meets the clip. The rate is limited to SPEED_MIN .. SPEED_MAX and, with max_seconds, by the footage
+    there is (a side never gets shorter than max_seconds); overlap copies stay at their own speed. The sound of the
+    parts is not retimed.
     """
     from collections import deque
     try:
@@ -569,12 +639,14 @@ def join_v2(source, out_path, before=(), after=(), before_reversed=False, drop_b
     Kb = int(round(float(overlap_before) * float(fps))) if before else 0
     Ka = int(round(float(overlap_after) * float(fps))) if after else 0
 
-    def side_plans(paths, which, K):
+    def side_plans(paths, which, K, rate=1.0):
         backwards = which == "before" and not before_reversed
         order = list(reversed(paths)) if backwards else list(paths)
         plans, left = [], max_seconds or 0.0
         ks = K / float(fps)
         for i, path in enumerate(order):
+            hs = K if K else 0
+            he = K if (K and i < len(order) - 1) else 0
             touching = i == 0
             if which == "after":
                 df, dl = (drop_after_first if touching else 0), 0
@@ -582,7 +654,8 @@ def join_v2(source, out_path, before=(), after=(), before_reversed=False, drop_b
                 df, dl = (drop_before_last if touching else 0), 0
             else:
                 df, dl = 0, (drop_before_last if touching else 0)
-            plan = _part_plan(path, fps, df, dl, (left + ks) if max_seconds else 0.0, keep="end" if backwards else "start")
+            plan = _part_plan(path, fps, df, dl, (left + ks) if max_seconds else 0.0, keep="end" if backwards else "start",
+                              rate=rate, hold_start=hs, hold_end=he)
             plans.append(plan)
             if max_seconds:
                 left -= plan["seconds"] - ks
@@ -590,7 +663,46 @@ def join_v2(source, out_path, before=(), after=(), before_reversed=False, drop_b
                     break
         return list(reversed(plans)) if backwards else plans
 
-    bplans, aplans = side_plans(before, "before", Kb), side_plans(after, "after", Ka)
+    speed = {}
+    if match_speed and (before or after):
+        try:
+            from . import extend_motion as em
+        except ImportError:
+            import extend_motion as em
+        nsrc, sf = sp["frames"], float(fps)
+        win = max(4, int(round(SPEED_WIN * sf)))
+        for which, paths, K in (("before", before, Kb), ("after", after, Ka)):
+            if not paths:
+                continue
+            if which == "before" and not before_reversed:      # the last part's end touches the source
+                gp = paths[-1]; gpr = probe(gp); pf = float(gpr["fps"])
+                hi = gpr["frames"] - int(drop_before_last)
+                gen = em.window_speed(gp, max(0, hi - int(round(SPEED_WIN * pf))), hi, cover=(W, H))
+            else:                                               # the first part's start (after its copy) touches it
+                gp = paths[0]; gpr = probe(gp); pf = float(gpr["fps"])
+                c0 = int(round(K / sf * pf)) if K else int(drop_after_first if which == "after" else drop_before_last)
+                gen = em.window_speed(gp, c0, c0 + int(round(SPEED_WIN * pf)), cover=(W, H))
+            src = em.window_speed(source, 0, win) if which == "before" else em.window_speed(source, nsrc - win, nsrc)
+            r = em.speed_ratio(src, gen)
+            want = r
+            r = float(np.clip(r, SPEED_MIN, SPEED_MAX))
+            if 1.0 / SPEED_SKIP < r < SPEED_SKIP:
+                r = 1.0
+            limit = ""
+            if r > 1.0 and max_seconds:
+                avail = 0.0
+                for q in paths:
+                    pq = probe(q)
+                    avail += pq["frames"] / float(pq["fps"]) - (K / sf if K else 0.0)
+                cap = avail / float(max_seconds)
+                if r > cap:
+                    r, limit = max(1.0, cap), "footage"
+            speed[which] = {"source": src, "generated": gen, "wanted": round(want, 2), "rate": round(r, 2)}
+            if limit:
+                speed[which]["limited_by"] = limit
+    rb = speed.get("before", {}).get("rate", 1.0)
+    ra = speed.get("after", {}).get("rate", 1.0)
+    bplans, aplans = side_plans(before, "before", Kb, rb), side_plans(after, "after", Ka, ra)
 
     # the hand-over needs the part's copy to line up with the source; if it doesn't (a model that reframed or
     # cropped), that join is cut and smoothed instead, and the copy frames are dropped
@@ -718,7 +830,7 @@ def join_v2(source, out_path, before=(), after=(), before_reversed=False, drop_b
 
     src_at = sum(owns[:si])
     report = {"fps": str(fps), "size": [W, H], "source_frames": sp["frames"], "source_at": src_at,
-              "overlap_frames": {"before": Kb, "after": Ka}, "handover": handover,
+              "overlap_frames": {"before": Kb, "after": Ka}, "handover": handover, "speed": speed,
               "before": [{"frames": len(p["picks"]), "seconds": round(p["seconds"], 3)} for p in bplans],
               "after": [{"frames": len(p["picks"]), "seconds": round(p["seconds"], 3)} for p in aplans]}
     if final_direct:
@@ -759,13 +871,13 @@ def join_v2(source, out_path, before=(), after=(), before_reversed=False, drop_b
             w0 = max(r0, at - Wn)
             gen = [need[i] for i in range(at - 1, w0 - 1, -1)]
             ref = [need[i] for i in range(at, min(n_total, at + 8))]
-            new, inf, Dg, amt = sm.fix_window(gen, ref, float(fps), med)
+            new, inf, Dg, amt = sm.fix_window(gen, ref, float(fps), med, speed=not speed)
             repl[side] = {"win": (w0, at), "frames": new[::-1], "rest": (r0, w0), "Dg": Dg, "sharpen": amt}
         else:
             w1 = min(r1, at + Wn)
             gen = [need[i] for i in range(at, w1)]
             ref = [need[i] for i in range(at - 1, max(-1, at - 9), -1)]
-            new, inf, Dg, amt = sm.fix_window(gen, ref, float(fps), med)
+            new, inf, Dg, amt = sm.fix_window(gen, ref, float(fps), med, speed=not speed)
             repl[side] = {"win": (at, w1), "frames": new, "rest": (w1, r1), "Dg": Dg, "sharpen": amt}
         inf["side"] = side
         info.append(inf)

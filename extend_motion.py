@@ -105,3 +105,44 @@ def edge_motion(path, seconds=1.0):
     text = ("Measured motion (the source's own speed at each edge): in its first %.1f s %s; in its last %.1f s %s."
             % (seconds, s["text"], seconds, e["text"]))
     return {"start": s, "end": e, "text": text}
+
+
+STILL_CAM, STILL_SUBJ = 0.03, 0.04   # frame widths per second below which a value counts as still
+
+
+def window_speed(path, i0, i1, cover=None):
+    """Camera speed and in-frame motion (frame widths per second) over raw frames i0 .. i1-1 of a file, or None.
+    cover=(W, H): measure the frames as they will be shown, scaled to cover W x H and centre-cropped (a part made
+    at another shape or padded with bars)."""
+    if cv2 is None:
+        return None
+    p = ec.probe(path)
+    fr = []
+    for i, a in enumerate(ec.iter_frames(path)):
+        if i >= i1:
+            break
+        if i >= i0:
+            if cover is not None:
+                W, H = cover
+                sc = max(W / float(a.shape[1]), H / float(a.shape[0]))
+                cw, ch = int(round(W / sc)), int(round(H / sc))
+                x, y = (a.shape[1] - cw) // 2, (a.shape[0] - ch) // 2
+                a = a[y:y + ch, x:x + cw]
+            fr.append(_gray(a, WORK_W))
+    if len(fr) < 4:
+        return None
+    st, fps = _steps(fr), float(p["fps"])
+    return {"camera": float(np.hypot(*np.median(st[:, :2], axis=0)) * fps), "subject": float(np.median(st[:, 3]) * fps)}
+
+
+def speed_ratio(src, gen):
+    """How much faster the source moves than the generated footage (geometric mean over camera and in-frame motion,
+    each only when the generated footage has that motion: a still camera can't be sped up into a moving one, that is
+    a content difference, not a speed one); 1.0 when nothing can be compared."""
+    if not src or not gen:
+        return 1.0
+    rs = []
+    for k, still in (("camera", STILL_CAM), ("subject", STILL_SUBJ)):
+        if gen[k] >= still:
+            rs.append(max(src[k], still / 2) / gen[k])
+    return float(np.exp(np.mean(np.log(rs)))) if rs else 1.0

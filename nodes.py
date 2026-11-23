@@ -90,7 +90,7 @@ class VideoExtendSegment:
             },
             "optional": {
                 "pad": ("BOOLEAN", {"default": False,
-                        "tooltip": "Centre the part on a 16:9 (landscape) or 9:16 (portrait) canvas with black bars, for a "
+                        "tooltip": "Centre the part on a 16:9 (landscape) or 9:16 (portrait) canvas with blurred bars, for a "
                                    "model that only makes those shapes (Gemini Omni crops anything else). Extend Join "
                                    "removes the bars again when it fits the result to the clip."}),
             },
@@ -151,6 +151,12 @@ class VideoExtendJoin:
                                  "tooltip": "Smooth every join with the source that is cut (no overlap), on the "
                                             "generated side only: repeated frames, camera motion, speed, alignment "
                                             "and colour. The source's frames stay as they are."}),
+                "match_speed": ("BOOLEAN", {"default": False,
+                                "tooltip": "Play each side at the source's speed (camera and motion measured over "
+                                           "2 s on each side of the join), so footage a model made slower or faster "
+                                           "than the clip keeps the clip's pace. Rate 0.67-1.6, and with max_seconds "
+                                           "never more than the footage allows: give the model extra seconds to "
+                                           "speed up into. The parts' sound is not retimed."}),
             },
         }
 
@@ -168,7 +174,7 @@ class VideoExtendJoin:
 
     def check_lazy_status(self, source, add_before, add_after, before_parts, after_parts, before_reversed=False,
                           drop_before_last=0, drop_after_first=0, max_seconds=0.0, overlap_before=0.0,
-                          overlap_after=0.0, smooth_joins=False, **parts):
+                          overlap_after=0.0, smooth_joins=False, match_speed=False, **parts):
         need = []
         if add_before:
             need += [f"before_{i}" for i in range(1, before_parts + 1) if parts.get(f"before_{i}") is None]
@@ -178,7 +184,7 @@ class VideoExtendJoin:
 
     def join(self, source, add_before, add_after, before_parts, after_parts, before_reversed=False,
              drop_before_last=0, drop_after_first=0, max_seconds=0.0, overlap_before=0.0, overlap_after=0.0,
-             smooth_joins=False, **parts):
+             smooth_joins=False, match_speed=False, **parts):
         def side(name, on, n):
             if not on:
                 return []
@@ -192,10 +198,11 @@ class VideoExtendJoin:
         if not before and not after:
             return (source, json.dumps({"note": "nothing to add"}), "")
         out = _temp("extend_join")
-        if smooth_joins or overlap_before or overlap_after:
+        if smooth_joins or overlap_before or overlap_after or match_speed:
             report = ec.join_v2(_as_file(source), out, before, after, bool(before_reversed), int(drop_before_last),
                                 int(drop_after_first), float(max_seconds), float(overlap_before or 0.0),
-                                float(overlap_after or 0.0), bool(smooth_joins), tmp_path=_temp("extend_join_a"))
+                                float(overlap_after or 0.0), bool(smooth_joins), tmp_path=_temp("extend_join_a"),
+                                match_speed=bool(match_speed))
         else:
             report = ec.join(_as_file(source), out, before, after, bool(before_reversed), int(drop_before_last),
                              int(drop_after_first), float(max_seconds))
@@ -353,6 +360,35 @@ class VideoExtendEdgeMotion:
         return (r["text"], json.dumps(r))
 
 
+class VideoExtendPadImage:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"image": ("IMAGE",)}}
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("image", "aspect_16_9")
+    OUTPUT_TOOLTIPS = ("The image centred on the nearest 16:9 (landscape, square) or 9:16 (portrait) canvas, the bars "
+                       "filled with a blurred, darkened copy of it; unchanged when it already has that shape.",
+                       "16:9 or 9:16, the canvas used.")
+    FUNCTION = "pad"
+    CATEGORY = CATEGORY
+    DESCRIPTION = ("Puts an image on a 16:9 / 9:16 canvas the way Extend Segment's pad does a clip, for a model that "
+                   "only makes those shapes (e.g. a start and an end frame for image-to-video); Extend Join's centred "
+                   "cover-crop removes the bars again.")
+
+    def pad(self, image):
+        out, aspect = [], "16:9"
+        for t in image:
+            a = (t.cpu().numpy() * 255.0 + 0.5).clip(0, 255).astype(np.uint8)
+            H, W = a.shape[:2]
+            W2, H2 = W - W % 2, H - H % 2
+            a = a[:H2, :W2]
+            box = ec.pad_box(W2, H2)
+            aspect = "16:9" if W2 >= H2 else "9:16"
+            out.append(_image(a if box[:2] == (W2, H2) else ec.pad_frame(a, box))[0])
+        return (torch.stack(out), aspect)
+
+
 NODE_CLASS_MAPPINGS = {
     "VideoExtendEdgeFrames": VideoExtendEdgeFrames,
     "VideoExtendSegment": VideoExtendSegment,
@@ -361,6 +397,7 @@ NODE_CLASS_MAPPINGS = {
     "VideoExtendSeamSplice": VideoExtendSeamSplice,
     "VideoExtendAutoResolution": VideoExtendAutoResolution,
     "VideoExtendEdgeMotion": VideoExtendEdgeMotion,
+    "VideoExtendPadImage": VideoExtendPadImage,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "VideoExtendEdgeFrames": "Video Edge Frames",
@@ -370,4 +407,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VideoExtendSeamSplice": "Extend Seam Splice",
     "VideoExtendAutoResolution": "Extend Auto Resolution",
     "VideoExtendEdgeMotion": "Extend Edge Motion",
+    "VideoExtendPadImage": "Extend Pad Image (16:9 / 9:16)",
 }

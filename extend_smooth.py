@@ -197,7 +197,7 @@ def _camera(fr, ref, fps, info):
     return out
 
 
-def fix_window(fr, ref, fps, motion_median):
+def fix_window(fr, ref, fps, motion_median, speed=True):
     """fr: generated frames, index 0 next to the join (at most the window); ref: the source's frames, index 0 next
     to the join (a few). Returns (new frames, info, overall colour offset for the rest of the part)."""
     info = {}
@@ -223,11 +223,13 @@ def fix_window(fr, ref, fps, motion_median):
             fr = _camera(fr, ref, fps, info)
         else:
             info["camera"] = "off (fast motion)"
+        if not fast and not speed:
+            info["speed"] = "off (the whole part is played at the source's speed)"
         if not fast:
             # 3. speed
             vr = np.median([m[0] for m in mr]); vg = np.median([m[0] for m in mg])
             R = float(np.clip(vr / max(vg, 1e-3), 1 / RATIO_MAX, RATIO_MAX)) if vg > 0.3 else 1.0
-            if max(R, 1 / R) > EASE_MIN:
+            if speed and max(R, 1 / R) > EASE_MIN:
                 E = max(4, int(round(EASE_S * fps)))
                 taus, t, d = [], 0.0, 0
                 while t <= len(fr) - 1 + 1e-6:
