@@ -146,3 +146,71 @@ def speed_ratio(src, gen):
         if gen[k] >= still:
             rs.append(max(src[k], still / 2) / gen[k])
     return float(np.exp(np.mean(np.log(rs)))) if rs else 1.0
+
+
+GUIDE_MAX_SHIFT = 0.6     # at most this many frame widths of camera travel are extrapolated for the opening guide
+GUIDE_SCALE = (0.67, 1.5)
+GUIDE_MISSING_MAX = 0.35  # at most this share of the guide is left for the image model to invent
+GUIDE_SUBJECT_MAX = 0.4   # frame widths per second: above this the action is the subject, not the camera
+
+
+def opening_guide(path, seconds, max_shift=GUIDE_MAX_SHIFT):
+    """The clip's first frame moved back along its own measured camera move by `seconds` (translation and zoom of
+    the first second, extrapolated, at most max_shift frame widths), for an image model to complete: the frame the
+    camera saw that long before. Used when the camera move is the action (the camera moves, the frame's own motion is
+    slow); otherwise the first frame is returned unchanged. Returns (guide uint8 HxWx3, used bool, info dict). The
+    area the first frame does not cover is filled with its edges, stretched and blurred."""
+    first = None
+    for a in ec.iter_frames(path):
+        first = a
+        break
+    info = {"used": False}
+    if cv2 is None or first is None:
+        info["why"] = "no OpenCV" if cv2 is None else "no frames"
+        return first, False, info
+    p = ec.probe(path)
+    fps = float(p["fps"])
+    k = max(2, min(p["frames"], int(round(fps)) + 1))
+    fr = []
+    for i, a in enumerate(ec.iter_frames(path)):
+        if i >= k:
+            break
+        fr.append(_gray(a, WORK_W))
+    st = _steps(fr)
+    dx, dy = float(np.median(st[:, 0])), float(np.median(st[:, 1]))        # widths per frame, content motion
+    z = float(np.median(st[:, 2])) - 1.0                                   # scale change per frame
+    subj = float(np.median(st[:, 3]) * fps)
+    cam = float(np.hypot(dx, dy) * fps)
+    zps = (1.0 + z) ** fps - 1.0
+    info.update({"camera": round(cam, 3), "zoom_per_s": round(zps, 3), "subject": round(subj, 3)})
+    if (cam < STILL_CAM and abs(zps) < ZOOM_STILL) or subj > GUIDE_SUBJECT_MAX:
+        info["why"] = "camera still" if subj <= GUIDE_SUBJECT_MAX else "the subject's motion is the action"
+        return first, False, info
+    H, W = first.shape[:2]
+    cx, cy = W / 2.0, H / 2.0
+    n = seconds * fps
+    tx0, ty0 = dx * n, dy * n
+    m = float(np.hypot(tx0, ty0))
+    if m > max_shift:
+        tx0, ty0 = tx0 * max_shift / m, ty0 * max_shift / m
+    S0 = float(np.clip((1.0 + z) ** n, *GUIDE_SCALE))
+    full = np.full((H, W), 255, np.uint8)
+    f = 1.0
+    while True:   # less of the move when too much of the frame would have to be invented
+        tx, ty, S = tx0 * f, ty0 * f, S0 ** f
+        # guide pixel g shows the content that is at S (g - c) + c + T in the first frame
+        M = np.float32([[S, 0, (1 - S) * cx + tx * W], [0, S, (1 - S) * cy + ty * W]])
+        valid = cv2.warpAffine(full, M, (W, H), flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP,
+                               borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        if 1 - (valid > 0).mean() <= GUIDE_MISSING_MAX or f < 0.05:
+            break
+        f *= 0.85
+    warped = cv2.warpAffine(first, M, (W, H), flags=cv2.INTER_LANCZOS4 | cv2.WARP_INVERSE_MAP,
+                            borderMode=cv2.BORDER_REPLICATE)
+    info["move_share"] = round(f, 2)
+    blur = cv2.GaussianBlur(warped, (0, 0), max(8.0, W / 60.0))
+    a = cv2.GaussianBlur((valid > 0).astype(np.float32), (0, 0), 3)[..., None]
+    guide = np.clip(warped * a + blur * (1 - a) + 0.5, 0, 255).astype(np.uint8)
+    info.update({"used": True, "shift_widths": [round(-tx, 3), round(-ty, 3)], "scale": round(1 / S, 3),
+                 "missing_share": round(1 - float((valid > 0).mean()), 3)})
+    return guide, True, info

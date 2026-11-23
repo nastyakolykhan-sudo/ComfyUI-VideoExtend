@@ -389,6 +389,31 @@ class VideoExtendPadImage:
         return (torch.stack(out), aspect)
 
 
+class VideoExtendOpeningGuide:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"video": ("VIDEO",),
+                             "seconds": ("FLOAT", {"default": 5.0, "min": 0.5, "max": 60.0, "step": 0.5,
+                                                   "tooltip": "How long before the clip's first frame the guide shows."})}}
+
+    RETURN_TYPES = ("IMAGE", "BOOLEAN", "STRING")
+    RETURN_NAMES = ("guide", "used", "report")
+    OUTPUT_TOOLTIPS = ("The clip's first frame moved back along its own camera move (blurred where the first frame "
+                       "doesn't reach), or the first frame unchanged when not used.",
+                       "Whether the camera move was used: true when the camera moves and the frame's own motion is "
+                       "slow (the move is the action).", "The measurements as JSON.")
+    FUNCTION = "guide"
+    CATEGORY = CATEGORY
+    DESCRIPTION = ("A guide for the frame the camera saw `seconds` before the clip starts: the first frame shifted and "
+                   "scaled back along the camera move measured in the clip's first second (at most 0.6 frame widths, "
+                   "and at most about a third of the frame left to fill), for an image model to complete. So a "
+                   "lead-in made from it to the first frame continues the clip's own camera move.")
+
+    def guide(self, video, seconds):
+        g, used, info = em.opening_guide(_as_file(video), float(seconds))
+        return (_image(g), bool(used), json.dumps(info))
+
+
 NODE_CLASS_MAPPINGS = {
     "VideoExtendEdgeFrames": VideoExtendEdgeFrames,
     "VideoExtendSegment": VideoExtendSegment,
@@ -398,6 +423,7 @@ NODE_CLASS_MAPPINGS = {
     "VideoExtendAutoResolution": VideoExtendAutoResolution,
     "VideoExtendEdgeMotion": VideoExtendEdgeMotion,
     "VideoExtendPadImage": VideoExtendPadImage,
+    "VideoExtendOpeningGuide": VideoExtendOpeningGuide,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "VideoExtendEdgeFrames": "Video Edge Frames",
@@ -408,4 +434,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VideoExtendAutoResolution": "Extend Auto Resolution",
     "VideoExtendEdgeMotion": "Extend Edge Motion",
     "VideoExtendPadImage": "Extend Pad Image (16:9 / 9:16)",
+    "VideoExtendOpeningGuide": "Extend Opening Guide",
 }
