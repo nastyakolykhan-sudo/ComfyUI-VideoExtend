@@ -145,29 +145,55 @@ def _write_audio(out, oa, wave):
         out.mux(p)
 
 
-def segment(src, out_path, part="tail", seconds=5.0, reverse=False, keep_audio=True, crf=12, preset="fast"):
+def pad_box(W, H):
+    """Where a W x H frame sits inside the nearest 16:9 (landscape) or 9:16 (portrait) canvas that contains it, with
+    black bars on two sides: (canvas_w, canvas_h, x, y). A model that only makes 16:9 or 9:16 then has nothing to
+    crop, and scaling its output to cover W x H (centred) removes the bars again exactly."""
+    target = 16.0 / 9.0 if W >= H else 9.0 / 16.0
+    if W / float(H) < target:
+        cw, ch = int(round(H * target / 2.0)) * 2, H
+    else:
+        cw, ch = W, int(round(W / target / 2.0)) * 2
+    return cw, ch, (cw - W) // 2, (ch - H) // 2
+
+
+def segment(src, out_path, part="tail", seconds=5.0, reverse=False, keep_audio=True, crf=12, preset="fast", pad=False):
     """The first (`head`) or last (`tail`) `seconds` of a clip (the whole clip when shorter), optionally played
-    backwards (audio is then dropped). Returns its real length in seconds."""
+    backwards (audio is then dropped), optionally centred on a 16:9 / 9:16 canvas with black bars (pad_box).
+    Returns its real length in seconds."""
     sp = probe(src)
     fps, n = sp["fps"], sp["frames"]
     k = max(1, min(n, int(round(seconds * float(fps))))) if seconds > 0 else n
     lo = 0 if part == "head" else n - k
     W, H = sp["width"] - sp["width"] % 2, sp["height"] - sp["height"] % 2
+    box = pad_box(W, H) if pad else (W, H, 0, 0)
+    if box[:2] == (W, H):
+        box = None
+
+    def fit(a):
+        a = a[:H, :W]
+        if box is None:
+            return a
+        cw, ch, x, y = box
+        c = np.zeros((ch, cw, 3), np.uint8)
+        c[y:y + H, x:x + W] = a
+        return c
     audio = keep_audio and not reverse and sp["audio"]
     wave = read_audio(src, lo / float(fps), k / float(fps)) if audio else None
-    out, vs, oa = _open_writer(out_path, fps, W, H, crf, preset, audio=wave is not None)
+    OW, OH = (box[0], box[1]) if box else (W, H)
+    out, vs, oa = _open_writer(out_path, fps, OW, OH, crf, preset, audio=wave is not None)
     try:
         if reverse:
             frames = [a[:H, :W] for i, a in enumerate(iter_frames(src)) if lo <= i < lo + k]
             for j, a in enumerate(reversed(frames)):
-                _put(out, vs, a, j)
+                _put(out, vs, fit(a), j)
         else:
             j = 0
             for i, a in enumerate(iter_frames(src)):
                 if i >= lo + k:
                     break
                 if i >= lo:
-                    _put(out, vs, a[:H, :W], j)
+                    _put(out, vs, fit(a), j)
                     j += 1
         for p in vs.encode():
             out.mux(p)
@@ -506,6 +532,15 @@ def _part_frames(plan, W, H):
         it_i += 1
 
 
+HANDOVER_MAD = 5.0   # mean grey-level difference (160 px wide) above which a part's copy does not line up with the
+                     # source (Gemini's own copy: about 1.5; a 1.33x reframed copy: 15+)
+
+
+def _small(a, w=160):
+    h = max(1, int(round(a.shape[0] * w / a.shape[1])))
+    return np.asarray(Image.fromarray(a).convert("L").resize((w, h), Image.BOX), np.float32)
+
+
 def _dissolve(a, b, al):
     return np.clip((1 - al) * a.astype(np.float32) + al * b.astype(np.float32) + 0.5, 0, 255).astype(np.uint8)
 
@@ -557,6 +592,30 @@ def join_v2(source, out_path, before=(), after=(), before_reversed=False, drop_b
 
     bplans, aplans = side_plans(before, "before", Kb), side_plans(after, "after", Ka)
 
+    # the hand-over needs the part's copy to line up with the source; if it doesn't (a model that reframed or
+    # cropped), that join is cut and smoothed instead, and the copy frames are dropped
+    handover = {}
+    if (Kb and bplans and before_reversed) or (Ka and aplans):
+        head, tail = [], []
+        for i, a in enumerate(iter_frames(source)):
+            if i < Kb:
+                head.append(_small(a[:H, :W]))
+            if i >= sp["frames"] - Ka:
+                tail.append(_small(a[:H, :W]))
+    Kb_src, Ka_src = Kb, Ka
+    if Ka and aplans:
+        copy = [_small(a) for _, a in zip(range(Ka), _part_frames(aplans[0], W, H))]
+        pairs = [(copy[q], tail[q]) for q in range(min(len(copy), len(tail)) - 5)]   # the last 5 are rewritten
+        mad = float(np.mean([np.abs(x - y).mean() for x, y in pairs])) if pairs else 99.0
+        if mad > HANDOVER_MAD:
+            Ka_src = 0
+            p0 = aplans[0]
+            p0["picks"] = p0["picks"][Ka:]
+            p0["seconds"] = len(p0["picks"]) / float(fps)
+            handover["after"] = "cut and smoothed: the part's copy did not line up (difference %.1f)" % mad
+        else:
+            handover["after"] = "dissolve (difference %.1f)" % mad
+
     # pieces in output order: (kind, frame iterator factory, frame count, k_next, audio plan)
     pieces = []
     if bplans and before_reversed:
@@ -570,7 +629,17 @@ def join_v2(source, out_path, before=(), after=(), before_reversed=False, drop_b
                 fr = fr[n:]
             seq += fr
         seq = seq[::-1]
-        pieces.append({"kind": "before", "it": (lambda s=seq: iter(s)), "n": len(seq), "k": Kb, "plan": None,
+        if Kb:
+            n_cmp = min(Kb, len(seq), len(head))
+            pairs = [(_small(seq[len(seq) - Kb + q]), head[q]) for q in range(5, n_cmp)]   # source frames 0-4 are rewritten
+            mad = float(np.mean([np.abs(x - y).mean() for x, y in pairs])) if pairs else 99.0
+            if mad > HANDOVER_MAD:
+                Kb_src = 0
+                seq = seq[:len(seq) - Kb]
+                handover["before"] = "cut and smoothed: the part's copy did not line up (difference %.1f)" % mad
+            else:
+                handover["before"] = "dissolve (difference %.1f)" % mad
+        pieces.append({"kind": "before", "it": (lambda s=seq: iter(s)), "n": len(seq), "k": Kb_src, "plan": None,
                        "silent": True})
     else:
         for i, plan in enumerate(bplans):
@@ -578,7 +647,7 @@ def join_v2(source, out_path, before=(), after=(), before_reversed=False, drop_b
             pieces.append({"kind": "before", "it": (lambda p=plan: _part_frames(p, W, H)), "n": len(plan["picks"]),
                            "k": Kb, "plan": plan, "silent": False, "skip_end": Kb})
     pieces.append({"kind": "source", "it": (lambda: (a[:H, :W] for a in iter_frames(source))), "n": sp["frames"],
-                   "k": Ka if aplans else 0, "plan": None})
+                   "k": Ka_src if aplans else 0, "plan": None})
     for i, plan in enumerate(aplans):
         pieces.append({"kind": "after", "it": (lambda p=plan: _part_frames(p, W, H)), "n": len(plan["picks"]),
                        "k": Ka if i < len(aplans) - 1 else 0, "plan": plan, "silent": False, "skip_start": Ka})
@@ -649,7 +718,7 @@ def join_v2(source, out_path, before=(), after=(), before_reversed=False, drop_b
 
     src_at = sum(owns[:si])
     report = {"fps": str(fps), "size": [W, H], "source_frames": sp["frames"], "source_at": src_at,
-              "overlap_frames": {"before": Kb, "after": Ka},
+              "overlap_frames": {"before": Kb, "after": Ka}, "handover": handover,
               "before": [{"frames": len(p["picks"]), "seconds": round(p["seconds"], 3)} for p in bplans],
               "after": [{"frames": len(p["picks"]), "seconds": round(p["seconds"], 3)} for p in aplans]}
     if final_direct:
@@ -660,10 +729,10 @@ def join_v2(source, out_path, before=(), after=(), before_reversed=False, drop_b
     # ---- pass B: smooth the joins with the source that were cut (no overlap)
     n_total = pts
     jobs = []      # (side, region_start, region_end, at)
-    if bplans and not Kb:
+    if bplans and not Kb_src:
         b_last = [l for l in layout if l["kind"] == "before"][-1]
         jobs.append(("before", b_last["start"], src_at, src_at))
-    if aplans and not Ka:
+    if aplans and not Ka_src:
         a_first = [l for l in layout if l["kind"] == "after"][0]
         jobs.append(("after", src_at + sp["frames"], a_first["end"], src_at + sp["frames"]))
     Wn = sm.window_frames(fps)
@@ -708,9 +777,9 @@ def join_v2(source, out_path, before=(), after=(), before_reversed=False, drop_b
     pts = 0
     # the source's own frames are taken from the source file (no second encode); only its dissolved ends (overlap)
     # come from pass A
-    s_lo, s_hi = src_at + Kb, src_at + sp["frames"] - Ka
+    s_lo, s_hi = src_at + Kb_src, src_at + sp["frames"] - Ka_src
     src_it = (a[:H, :W] for a in iter_frames(source))
-    for _ in range(Kb):
+    for _ in range(Kb_src):
         next(src_it, None)
     try:
         for i, a in enumerate(iter_frames(target)):

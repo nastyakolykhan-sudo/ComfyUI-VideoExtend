@@ -8,6 +8,7 @@ import torch
 import folder_paths
 
 from . import extend_core as ec
+from . import extend_motion as em
 
 try:
     from comfy_api.latest import InputImpl
@@ -87,6 +88,12 @@ class VideoExtendSegment:
                                        "can make what comes before it."}),
                 "audio": (["keep", "drop"], {"default": "keep"}),
             },
+            "optional": {
+                "pad": ("BOOLEAN", {"default": False,
+                        "tooltip": "Centre the part on a 16:9 (landscape) or 9:16 (portrait) canvas with black bars, for a "
+                                   "model that only makes those shapes (Gemini Omni crops anything else). Extend Join "
+                                   "removes the bars again when it fits the result to the clip."}),
+            },
         }
 
     RETURN_TYPES = ("VIDEO", "FLOAT")
@@ -97,9 +104,9 @@ class VideoExtendSegment:
     DESCRIPTION = ("The first or last seconds of a video, optionally played backwards: what a model that continues a "
                    "clip needs to see (most read only the last seconds).")
 
-    def segment(self, video, part, seconds, reverse, audio):
+    def segment(self, video, part, seconds, reverse, audio, pad=False):
         out = _temp("extend_segment")
-        secs = ec.segment(_as_file(video), out, part, float(seconds), bool(reverse), audio == "keep")
+        secs = ec.segment(_as_file(video), out, part, float(seconds), bool(reverse), audio == "keep", pad=bool(pad))
         return (VideoFromFile(out), float(secs))
 
 
@@ -306,10 +313,12 @@ class VideoExtendAutoResolution:
     def INPUT_TYPES(cls):
         return {"required": {"video": ("VIDEO",)}}
 
-    RETURN_TYPES = ("STRING", "INT")
-    RETURN_NAMES = ("resolution", "short_side")
+    RETURN_TYPES = ("STRING", "INT", "STRING")
+    RETURN_NAMES = ("resolution", "short_side", "aspect_16_9")
     OUTPUT_TOOLTIPS = ("480p, 720p or 1080p: the generation resolution nearest the clip (up to 600 px on the short "
-                       "side -> 480p, up to 900 -> 720p, larger -> 1080p).", "The clip's short side in px.")
+                       "side -> 480p, up to 900 -> 720p, larger -> 1080p).", "The clip's short side in px.",
+                       "16:9 for a landscape (or square) clip, 9:16 for a portrait one: the canvas Extend Segment's pad "
+                       "uses, for models that only make those shapes.")
     FUNCTION = "pick"
     CATEGORY = CATEGORY
     DESCRIPTION = ("Picks the generation resolution from the clip itself, so the new footage is made as close to the "
@@ -319,7 +328,30 @@ class VideoExtendAutoResolution:
         p = ec.probe(_as_file(video))
         short = min(p["width"], p["height"])
         res = "480p" if short <= 600 else "720p" if short <= 900 else "1080p"
-        return (res, int(short))
+        return (res, int(short), "16:9" if p["width"] >= p["height"] else "9:16")
+
+
+class VideoExtendEdgeMotion:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"video": ("VIDEO",)},
+                "optional": {"seconds": ("FLOAT", {"default": 1.0, "min": 0.2, "max": 5.0, "step": 0.1,
+                                                   "tooltip": "How much of each edge is measured."})}}
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("motion", "report")
+    OUTPUT_TOOLTIPS = ("One sentence with the camera's and the subject's speed (and the camera's direction and zoom) "
+                       "in the clip's first and last seconds, in words and frame widths per second; empty when it "
+                       "cannot be measured.", "The measurements as JSON.")
+    FUNCTION = "measure"
+    CATEGORY = CATEGORY
+    DESCRIPTION = ("Measures how fast the clip moves at its start and its end (optical flow), for a prompt writer: "
+                   "so that generated footage joined there keeps the same pace instead of winding down.")
+
+    def measure(self, video, seconds=1.0):
+        r = em.edge_motion(_as_file(video), float(seconds))
+        return (r["text"], json.dumps(r))
+
 
 NODE_CLASS_MAPPINGS = {
     "VideoExtendEdgeFrames": VideoExtendEdgeFrames,
@@ -328,6 +360,7 @@ NODE_CLASS_MAPPINGS = {
     "VideoExtendSeamWindows": VideoExtendSeamWindows,
     "VideoExtendSeamSplice": VideoExtendSeamSplice,
     "VideoExtendAutoResolution": VideoExtendAutoResolution,
+    "VideoExtendEdgeMotion": VideoExtendEdgeMotion,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "VideoExtendEdgeFrames": "Video Edge Frames",
@@ -336,4 +369,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VideoExtendSeamWindows": "Extend Seam Windows",
     "VideoExtendSeamSplice": "Extend Seam Splice",
     "VideoExtendAutoResolution": "Extend Auto Resolution",
+    "VideoExtendEdgeMotion": "Extend Edge Motion",
 }
