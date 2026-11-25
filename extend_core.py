@@ -233,11 +233,14 @@ def _cover(a, W, H):
     return np.asarray(im)[y:y + H, x:x + W]
 
 
-def _part_plan(path, fps_out, drop_first, drop_last, max_seconds, keep="start", rate=1.0, hold_start=0, hold_end=0):
+def _part_plan(path, fps_out, drop_first, drop_last, max_seconds, keep="start", rate=1.0, hold_start=0, hold_end=0,
+               interp=False):
     """Which frames of a part are kept, and which of them land on each output frame (matched by time).
     When max_seconds cuts the part, keep="start" keeps its beginning, keep="end" its end (a part before the source).
     rate: playback speed (1 = as generated); the first hold_start / last hold_end output frames stay at 1 (a copy that
-    is dissolved with the piece next to it). With a rate, picks are fractional positions (blended in _part_frames)."""
+    is dissolved with the piece next to it). With a rate, picks are fractional positions (blended in _part_frames).
+    interp: when the part's frame rate differs from the output's, picks are fractional positions too, and
+    _part_frames makes those frames from optical flow instead of repeating frames (24 fps footage in a 30 fps clip)."""
     p = probe(path)
     n = p["frames"]
     lo, hi = min(drop_first, n - 1), max(min(drop_first, n - 1) + 1, n - drop_last)
@@ -250,9 +253,15 @@ def _part_plan(path, fps_out, drop_first, drop_last, max_seconds, keep="start", 
         if max_seconds and dur > max_seconds:
             dur = max_seconds
         m = max(1, int(round(dur * float(fps_out))))
-        picks = [min(lo + kept - 1, lo + int(math.floor(j * ratio + 1e-6))) for j in range(m)]
+        if interp and abs(ratio - 1.0) > INTERP_MIN_DIFF:
+            picks = [min(float(lo + kept - 1), lo + j * ratio) for j in range(m)]
+            if keep == "end":   # the frame next to the source (the part's last) lands exactly on a real frame
+                off = (lo + kept - 1) - picks[-1]
+                picks = [min(float(lo + kept - 1), x + off) for x in picks]
+        else:
+            picks = [min(lo + kept - 1, lo + int(math.floor(j * ratio + 1e-6))) for j in range(m)]
         return {"path": path, "probe": p, "lo": lo, "kept": kept, "picks": picks, "seconds": m / float(fps_out),
-                "rate": 1.0}
+                "rate": 1.0, "interp": bool(interp)}
     # positions measured from the end that is kept (the start for keep="start", the end for keep="end")
     span = (hi - lo) - 1
     pos, j = [], 0
@@ -273,7 +282,7 @@ def _part_plan(path, fps_out, drop_first, drop_last, max_seconds, keep="start", 
     picks = [lo + x for x in pos]
     lo2 = int(math.floor(min(picks))) if picks else lo
     return {"path": path, "probe": p, "lo": lo2, "kept": hi - lo2, "picks": picks, "seconds": len(picks) / float(fps_out),
-            "rate": float(rate)}
+            "rate": float(rate), "interp": bool(interp)}
 
 
 def _fade(wave, n_in, n_out):
@@ -552,9 +561,42 @@ def _ease(t):
     return 0.5 - 0.5 * math.cos(math.pi * t)
 
 
+INTERP_MIN_DIFF = 0.01   # frame rates closer than this (share) are matched by picking frames, not interpolating
+INTERP_MAX_MEAN = 20.0   # px/frame at 1920 wide: above this mean motion (or the peak below), an in-between frame
+INTERP_MAX_PEAK = 60.0   # from optical flow would smear, so the nearest real frame is used instead
+
+
+class _Tween:
+    """In-between frames from optical flow for one part, the flow of each frame pair computed once."""
+    def __init__(self, W, H):
+        try:
+            from . import extend_smooth as es
+        except ImportError:
+            import extend_smooth as es
+        self.ok = es.cv2 is not None
+        self.flow = es.Flow(W, H) if self.ok else None
+        self.pairs = {}
+        self.used = self.nearest = 0
+
+    def __call__(self, a, b, i0, t):
+        if not self.ok:
+            return a if t < 0.5 else b
+        fast = self.pairs.get(i0)
+        if fast is None:
+            mean, peak = self.flow.mag(a, b)
+            fast = mean > INTERP_MAX_MEAN or peak > INTERP_MAX_PEAK
+            self.pairs = {i0: fast}
+        if fast:
+            self.nearest += 1
+            return a if t < 0.5 else b
+        self.used += 1
+        return self.flow.between(a, b, t)
+
+
 def _part_frames(plan, W, H):
-    """A part's planned frames (matched to the output frame rate), scaled to cover W x H. A fractional pick (a part
-    played at another speed) blends its two neighbouring frames."""
+    """A part's planned frames (matched to the output frame rate), scaled to cover W x H. A fractional pick blends
+    its two neighbouring frames (a part played at another speed), or, for a part at another frame rate (plan
+    "interp"), is made from optical flow between them (the nearest real frame when the motion is too fast)."""
     want = plan["picks"]
     if not want:
         return
@@ -562,6 +604,8 @@ def _part_frames(plan, W, H):
     for x in want:
         need.add(int(math.floor(x))); need.add(int(math.ceil(x)))
     cache, it_i, last = {}, 0, None
+    tween = _Tween(W, H) if plan.get("interp") else None
+    plan["tween"] = tween
 
     def ready(x):
         return int(math.floor(x)) in cache and int(math.ceil(x)) in cache
@@ -573,6 +617,8 @@ def _part_frames(plan, W, H):
             return cache[i0]
         if w > 0.98:
             return cache[i1]
+        if tween is not None and abs(plan.get("rate", 1.0) - 1.0) < 1e-6:
+            return tween(cache[i0], cache[i1], i0, w)
         return _dissolve(cache[i0], cache[i1], w)
 
     for i, a in enumerate(iter_frames(plan["path"])):
@@ -610,10 +656,18 @@ def _dissolve(a, b, al):
     return np.clip((1 - al) * a.astype(np.float32) + al * b.astype(np.float32) + 0.5, 0, 255).astype(np.uint8)
 
 
+def _plan_info(p):
+    d = {"frames": len(p["picks"]), "seconds": round(p["seconds"], 3), "fps": str(p["probe"]["fps"])}
+    t = p.get("tween")
+    if t is not None:
+        d["in_between"] = {"from_flow": t.used, "nearest_frame (fast motion)": t.nearest}
+    return d
+
+
 def join_v2(source, out_path, before=(), after=(), before_reversed=False, drop_before_last=0, drop_after_first=0,
             max_seconds=0.0, overlap_before=0.0, overlap_after=0.0, smooth=False, fade=0.08, crf=12, preset="fast",
-            tmp_path=None, match_speed=False):
-    """join() plus two options.
+            tmp_path=None, match_speed=False, interpolate=True):
+    """join() plus these options.
 
     overlap_before / overlap_after (seconds): each part on that side starts (toward the source) with its own copy of
     that many seconds of the piece next to it (Gemini returns its input + the new footage; slice it that much early).
@@ -626,6 +680,8 @@ def join_v2(source, out_path, before=(), after=(), before_reversed=False, drop_b
     where it meets the clip. The rate is limited to SPEED_MIN .. SPEED_MAX and, with max_seconds, by the footage
     there is (a side never gets shorter than max_seconds); overlap copies stay at their own speed. The sound of the
     parts is not retimed.
+    interpolate: a part made at another frame rate than the clip's (24 fps footage in a 30 fps clip) gets its
+    in-between frames from optical flow instead of repeated frames, so it plays as smoothly as the clip.
     """
     from collections import deque
     try:
@@ -655,7 +711,7 @@ def join_v2(source, out_path, before=(), after=(), before_reversed=False, drop_b
             else:
                 df, dl = 0, (drop_before_last if touching else 0)
             plan = _part_plan(path, fps, df, dl, (left + ks) if max_seconds else 0.0, keep="end" if backwards else "start",
-                              rate=rate, hold_start=hs, hold_end=he)
+                              rate=rate, hold_start=hs, hold_end=he, interp=interpolate)
             plans.append(plan)
             if max_seconds:
                 left -= plan["seconds"] - ks
@@ -831,8 +887,7 @@ def join_v2(source, out_path, before=(), after=(), before_reversed=False, drop_b
     src_at = sum(owns[:si])
     report = {"fps": str(fps), "size": [W, H], "source_frames": sp["frames"], "source_at": src_at,
               "overlap_frames": {"before": Kb, "after": Ka}, "handover": handover, "speed": speed,
-              "before": [{"frames": len(p["picks"]), "seconds": round(p["seconds"], 3)} for p in bplans],
-              "after": [{"frames": len(p["picks"]), "seconds": round(p["seconds"], 3)} for p in aplans]}
+              "before": [_plan_info(p) for p in bplans], "after": [_plan_info(p) for p in aplans]}
     if final_direct:
         report.update(frames=pts, seconds=round(pts / float(fps), 3), audio=has_audio,
                       seams=[x for x in ([src_at] if bplans else []) + ([src_at + sp["frames"]] if aplans else [])])
