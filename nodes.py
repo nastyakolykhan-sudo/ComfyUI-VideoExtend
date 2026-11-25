@@ -157,6 +157,11 @@ class VideoExtendJoin:
                                            "than the clip keeps the clip's pace. Rate 0.67-1.6, and with max_seconds "
                                            "never more than the footage allows: give the model extra seconds to "
                                            "speed up into. The parts' sound is not retimed."}),
+                "frame_interpolation": ("BOOLEAN", {"default": False,
+                                        "tooltip": "A part made at another frame rate than the source (24 fps "
+                                                   "footage in a 30 fps clip) gets its in-between frames from optical "
+                                                   "flow instead of repeated frames (the nearest real frame where the "
+                                                   "motion is too fast). Off = frames picked by time."}),
             },
         }
 
@@ -174,7 +179,8 @@ class VideoExtendJoin:
 
     def check_lazy_status(self, source, add_before, add_after, before_parts, after_parts, before_reversed=False,
                           drop_before_last=0, drop_after_first=0, max_seconds=0.0, overlap_before=0.0,
-                          overlap_after=0.0, smooth_joins=False, match_speed=False, **parts):
+                          overlap_after=0.0, smooth_joins=False, match_speed=False, frame_interpolation=False,
+                          **parts):
         need = []
         if add_before:
             need += [f"before_{i}" for i in range(1, before_parts + 1) if parts.get(f"before_{i}") is None]
@@ -184,7 +190,7 @@ class VideoExtendJoin:
 
     def join(self, source, add_before, add_after, before_parts, after_parts, before_reversed=False,
              drop_before_last=0, drop_after_first=0, max_seconds=0.0, overlap_before=0.0, overlap_after=0.0,
-             smooth_joins=False, match_speed=False, **parts):
+             smooth_joins=False, match_speed=False, frame_interpolation=False, **parts):
         def side(name, on, n):
             if not on:
                 return []
@@ -198,11 +204,11 @@ class VideoExtendJoin:
         if not before and not after:
             return (source, json.dumps({"note": "nothing to add"}), "")
         out = _temp("extend_join")
-        if smooth_joins or overlap_before or overlap_after or match_speed:
+        if smooth_joins or overlap_before or overlap_after or match_speed or frame_interpolation:
             report = ec.join_v2(_as_file(source), out, before, after, bool(before_reversed), int(drop_before_last),
                                 int(drop_after_first), float(max_seconds), float(overlap_before or 0.0),
                                 float(overlap_after or 0.0), bool(smooth_joins), tmp_path=_temp("extend_join_a"),
-                                match_speed=bool(match_speed))
+                                match_speed=bool(match_speed), interpolate=bool(frame_interpolation))
         else:
             report = ec.join(_as_file(source), out, before, after, bool(before_reversed), int(drop_before_last),
                              int(drop_after_first), float(max_seconds))

@@ -666,7 +666,7 @@ def _plan_info(p):
 
 def join_v2(source, out_path, before=(), after=(), before_reversed=False, drop_before_last=0, drop_after_first=0,
             max_seconds=0.0, overlap_before=0.0, overlap_after=0.0, smooth=False, fade=0.08, crf=12, preset="fast",
-            tmp_path=None, match_speed=False, interpolate=True):
+            tmp_path=None, match_speed=False, interpolate=False):
     """join() plus these options.
 
     overlap_before / overlap_after (seconds): each part on that side starts (toward the source) with its own copy of
